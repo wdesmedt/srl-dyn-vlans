@@ -1,0 +1,277 @@
+{
+  "freeTextAnnotations": [],
+  "freeShapeAnnotations": [],
+  "trafficRateAnnotations": [],
+  "groupStyleAnnotations": [],
+  "networkNodeAnnotations": [],
+  "nodeAnnotations": [
+    {
+      "id": "spine1",
+      "interfacePattern": "e1-{n}",
+      "position": {
+        "x": -20,
+        "y": 140
+      }
+    },
+    {
+      "id": "spine2",
+      "interfacePattern": "e1-{n}",
+      "position": {
+        "x": 280,
+        "y": 160
+      }
+    },
+    {
+      "id": "leaf1",
+      "interfacePattern": "e1-{n}",
+      "position": {
+        "x": -420,
+        "y": 380
+      }
+    },
+    {
+      "id": "leaf2",
+      "interfacePattern": "e1-{n}",
+      "position": {
+        "x": 100,
+        "y": 380
+      }
+    },
+    {
+      "id": "leaf3",
+      "interfacePattern": "e1-{n}",
+      "position": {
+        "x": 240,
+        "y": 380
+      }
+    },
+    {
+      "id": "leaf4",
+      "interfacePattern": "e1-{n}",
+      "position": {
+        "x": 420,
+        "y": 380
+      }
+    },
+    {
+      "id": "mh-client1",
+      "position": {
+        "x": -40,
+        "y": 500
+      }
+    },
+    {
+      "id": "mh-client2",
+      "position": {
+        "x": 100,
+        "y": 500
+      }
+    },
+    {
+      "id": "sh-client1",
+      "position": {
+        "x": -700,
+        "y": 520
+      }
+    },
+    {
+      "id": "mh-client3",
+      "position": {
+        "x": 480,
+        "y": 500
+      }
+    },
+    {
+      "id": "mh-client4",
+      "position": {
+        "x": -20,
+        "y": 1120
+      }
+    },
+    {
+      "id": "sh-client3",
+      "position": {
+        "x": -300,
+        "y": 480
+      }
+    },
+    {
+      "id": "mh-client20",
+      "position": {
+        "x": 540,
+        "y": 120
+      }
+    },
+    {
+      "id": "mh-client19",
+      "position": {
+        "x": 680,
+        "y": 460
+      }
+    },
+    {
+      "id": "mh-client18",
+      "position": {
+        "x": 1020,
+        "y": 440
+      }
+    },
+    {
+      "id": "mh-client17",
+      "position": {
+        "x": 620,
+        "y": 560
+      }
+    },
+    {
+      "id": "mh-client16",
+      "position": {
+        "x": 500,
+        "y": 680
+      }
+    },
+    {
+      "id": "mh-client15",
+      "position": {
+        "x": 420,
+        "y": 740
+      }
+    },
+    {
+      "id": "mh-client14",
+      "position": {
+        "x": 360,
+        "y": 840
+      }
+    },
+    {
+      "id": "mh-client13",
+      "position": {
+        "x": 600,
+        "y": 660
+      }
+    },
+    {
+      "id": "mh-client12",
+      "position": {
+        "x": 300,
+        "y": 920
+      }
+    },
+    {
+      "id": "mh-client11",
+      "position": {
+        "x": 240,
+        "y": 1060
+      }
+    },
+    {
+      "id": "mh-client10",
+      "position": {
+        "x": -120,
+        "y": 1100
+      }
+    },
+    {
+      "id": "mh-client9",
+      "position": {
+        "x": -220,
+        "y": 1080
+      }
+    },
+    {
+      "id": "mh-client8",
+      "position": {
+        "x": -340,
+        "y": 1060
+      }
+    },
+    {
+      "id": "mh-client7",
+      "position": {
+        "x": -440,
+        "y": 1000
+      }
+    },
+    {
+      "id": "mh-client6",
+      "position": {
+        "x": -520,
+        "y": 980
+      }
+    },
+    {
+      "id": "mh-client5",
+      "position": {
+        "x": -620,
+        "y": 960
+      }
+    },
+    {
+      "id": "sh-client20",
+      "position": {
+        "x": 120,
+        "y": 1180
+      }
+    },
+    {
+      "id": "sh-client19",
+      "position": {
+        "x": 160,
+        "y": 1400
+      }
+    },
+    {
+      "id": "sh-client18",
+      "position": {
+        "x": 200,
+        "y": 0
+      }
+    },
+    {
+      "id": "sh-client17",
+      "position": {
+        "x": 80,
+        "y": -40
+      }
+    },
+    {
+      "id": "sh-client16",
+      "position": {
+        "x": -400,
+        "y": 140
+      }
+    },
+    {
+      "id": "sh-client15",
+      "position": {
+        "x": -300,
+        "y": 100
+      }
+    },
+    {
+      "id": "sh-client14",
+      "position": {
+        "x": -340,
+        "y": 40
+      }
+    },
+    {
+      "id": "sh-client13",
+      "position": {
+        "x": -220,
+        "y": 0
+      }
+    },
+    {
+      "id": "sh-client12",
+      "position": {
+        "x": -100,
+        "y": -20
+      }
+    }
+  ],
+  "edgeAnnotations": [],
+  "aliasEndpointAnnotations": [],
+  "viewerSettings": {}
+}
