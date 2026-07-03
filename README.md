@@ -158,20 +158,20 @@ The excluded VLANs appear in `active-vlans` (detection happens upstream of the h
 [vmotion.py](file:///home/wds/github/srl-dyn-vlans/vmotion.py) (with the in-container announcer [rarp_agent.py](file:///home/wds/github/srl-dyn-vlans/rarp_agent.py)) emulates a VMware vSphere **vMotion**: a "VM" — a fixed MAC + IP on a VLAN — moves from a source client/leaf-port to a target client/leaf-port and, exactly like ESXi, announces its new location with a gratuitous **RARP** (EtherType `0x8035`). It answers the question *"is the RARP sufficient when the VLAN may not yet exist on the target leaf?"* by timing, relative to the cutover (`t0`), when the target leaf provisions the sub-interface, when the VM MAC becomes local there, and when the source leaf releases it (EVPN mobility) — plus the dataplane outage seen by a stationary peer.
 
 ```bash
-# Cross-leaf move (leaf1 -> leaf3) with a stationary peer on leaf1, full emulation:
-./vmotion.py --vlan 1060 --src sh-client1 --dst sh-client11 --peer sh-client5 --flush-source-leaf
+# Cross-leaf move (leaf1 -> leaf3) with a stationary peer on leaf1 (no flush — realistic):
+./vmotion.py --vlan 1060 --src sh-client1 --dst sh-client11 --peer sh-client5
 # Show the single-RARP failure mode instead:
 ./vmotion.py --vlan 1061 --src sh-client1 --dst sh-client11 --rarp-mode once
 ```
 
-Key options: `--rarp-mode {once,burst,sustained}` (default `sustained`); `--flush-source-leaf` (see below); `--peer <client>` (measure outage); `--vlan/--src/--dst`; `--json-report`.
+Key options: `--rarp-mode {once,burst,sustained}` (default `sustained`); `--peer <client>` (measure outage); `--vlan/--src/--dst`; `--flush-source-leaf` (force source-leaf teardown — *not* realistic, see below); `--json-report`.
 
 ### Two things a bare RARP does **not** solve on dynamic sub-interfaces
 
 1. **The RARP is consumed as the active-VLAN trigger, not forwarded.** The first tagged frame on a cold target port is what *triggers* dynamic provisioning; it arrives before the sub-interface/MAC-VRF exist and is dropped. A real single-shot vMotion RARP is therefore lost — the tool counts how many RARPs land "before subif existed". You need **sustained** announcement (or continued VM traffic) spanning the ~0.2–1 s provisioning window; `--rarp-mode once` reproduces the failure.
-2. **The source leaf keeps the VM MAC as a stale *local* entry.** Deleting the VM from the source *host* does not bring down the source *leaf's* dynamic sub-interface — it persists under the `retention-timer` (10 min here) — so the source leaf keeps advertising/holding the MAC locally and the moved MAC (same mobility sequence) never wins. Peers keep black-holing until the entry ages out. `--flush-source-leaf` emulates the source vNIC going link-down (deletes the source leaf sub-interface), which flushes it and lets EVPN mobility complete in ~1 s.
+2. **The source leaf keeps the VM MAC local — mobility must *out-compete* it, not flush it.** Deleting the VM from the source *host* does not bring down the source *leaf's* dynamic sub-interface — it persists under the `retention-timer` (10 min here) — so the source leaf keeps a **local** MAC entry that ages normally (~5 min; it is *not* frozen by MAC-duplication). EVPN mobility resolves this by traffic: **the moved VM must keep sourcing frames on the target** so the target re-asserts the MAC as local and wins the mobility arbitration, at which point the source leaf flips the entry to remote (`evpn`, vtep = target). If the VM instead goes quiet right after the move, the source's still-aging local entry wins and the *target yields to remote* — both leaves then point back to the source and peers black-hole until the source entry ages out (~5 min). A real migrated VM keeps sending, so a cross-leaf move **converges on its own in ~6–13 s with no source-side action** — the tool sustains the announcement through the whole mobility phase to model this. `--flush-source-leaf` deletes the source leaf sub-interface to force the release instantly, but that is **not realistic**: an ESXi trunk port stays up when a single VM leaves. Use it only to contrast against the realistic (no-flush) path.
 
-> The RARP is also useless across leaves unless route-targets match — which is exactly what the [`rt-asn`](#the-rt-asn-option-consistent-route-targets) fix guarantees. With all three in place (matched RT + sustained RARP + source flush) a cross-leaf move converges in the control plane in ~1 s, with a dataplane outage of a few seconds dominated by dynamic provisioning.
+> The RARP is also useless across leaves unless route-targets match — which is exactly what the [`rt-asn`](#the-rt-asn-option-consistent-route-targets) fix guarantees. With matched RT + sustained announcement (the moved VM continuing to source traffic), a cross-leaf move converges in the control plane in ~6–13 s with **no flush**, the dataplane outage being that provisioning + mobility-arbitration window.
 
 ---
 
