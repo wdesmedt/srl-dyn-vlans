@@ -435,6 +435,11 @@ def main():
 
     vlans = parse_vlans(args.vlans)
     N = len(vlans)
+    if not vlans:
+        print(f"ERROR: --vlans '{args.vlans}' parsed to no VLAN IDs — an empty or reversed "
+              f"range? A 'low-high' range must be ascending (e.g. 2699-3200, not 3200-2699).",
+              file=sys.stderr)
+        sys.exit(1)
     mgmt = args.leaf_mgmt or docker_mgmt_ip(args.node)
     if not mgmt:
         print(f"ERROR: could not determine gNMI mgmt IP for node '{args.node}' via "
