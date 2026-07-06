@@ -27,8 +27,8 @@ graph TD
     subgraph Clients
         sh1[sh-client1..10]
         sh11[sh-client11..20]
-        mh1[mh-client1..10 <br> static bond]
-        mh11[mh-client11..20 <br> static bond]
+        mh1[mh-client1..10 <br> LACP bond]
+        mh11[mh-client11..20 <br> LACP bond]
     end
 
     %% Fabric Links
@@ -46,11 +46,11 @@ graph TD
 ### Components
 1. **SR Linux Fabric**:
    - **Spines (`spine1`, `spine2`)**: Serve as BGP EVPN Route Reflectors.
-   - **Leaves (`leaf1` to `leaf4`)**: Run SR Linux. `leaf1` and `leaf3` host single-homed clients. `leaf1`/`leaf2` and `leaf3`/`leaf4` present a **shared-ESI EVPN Ethernet Segment** (all-active) toward the multi-homed clients — on **plain `ethernet-1/11..20`, not a LAG** (see [Multi-homing](#multi-homing-mh-clients-plain-ethernet-shared-esi)).
-   - **Dynamic Subinterface Event Handler**: A MicroPython event script executing on the leaves. It monitors ports for active VLAN tags and dynamically configures/deconfigures corresponding subinterfaces (and, for single-homed ports, their MAC-VRF network instances and VXLAN tunnel interfaces) on demand. All four leaves run the customized single-homed `dyn_subif_custom.py` on `ethernet-1/{1..10}` **and** the customized multi-homing `dyn_subif_mh_custom.py` on the ES ports `ethernet-1/{11..20}` (the stock `dynamic-subinterfaces.py` / `dynamic-subinterfaces-multi-homing.py` are kept only as reference copies). See [Dynamic Subinterface Event Handler](#dynamic-subinterface-event-handler) below.
+   - **Leaves (`leaf1` to `leaf4`)**: Run SR Linux. `leaf1` and `leaf3` host single-homed clients. `leaf1`/`leaf2` and `leaf3`/`leaf4` present a **shared-ESI EVPN Ethernet Segment** (all-active) toward the multi-homed clients — as **LACP LAGs `lag11..20`** (members `ethernet-1/11..20`), see [Multi-homing](#multi-homing-mh-clients-lacp-lag-shared-esi).
+   - **Dynamic Subinterface Event Handler**: A MicroPython event script executing on the leaves. It monitors ports for active VLAN tags and dynamically configures/deconfigures corresponding subinterfaces (and, for single-homed ports, their MAC-VRF network instances and VXLAN tunnel interfaces) on demand. All four leaves run the customized single-homed `dyn_subif_custom.py` on `ethernet-1/{1..10}` **and** the customized multi-homing `dyn_subif_mh_custom.py` on the ES LAGs `lag{11..20}` (the stock `dynamic-subinterfaces.py` / `dynamic-subinterfaces-multi-homing.py` are kept only as reference copies). See [Dynamic Subinterface Event Handler](#dynamic-subinterface-event-handler) below.
 2. **Linux Clients**:
    - **Single-homed (`sh-client1`..`20`)**: Connected via a single interface (`eth1`).
-   - **Multi-homed (`mh-client1`..`20`)**: Connected via a **static, LACP-less `bond0` (`mode balance-xor`)** across a leaf pair, matching the leaves' plain-ethernet shared-ESI segment for all-active multi-homing. (Not `802.3ad`: the leaf side is plain ethernet, so there is no LACP partner — see [Multi-homing](#multi-homing-mh-clients-plain-ethernet-shared-esi).)
+   - **Multi-homed (`mh-client1`..`20`)**: Connected via an **LACP `bond0` (`mode 802.3ad`)** across a leaf pair, matching the leaves' shared-ESI LACP LAG for all-active multi-homing (see [Multi-homing](#multi-homing-mh-clients-lacp-lag-shared-esi)).
 
 ---
 
@@ -66,9 +66,9 @@ These scripts ship in this repo:
 |--------|--------|---------|------------|
 | `dynamic-subinterfaces.py` | Stock single-homed, extracted verbatim from the SR Linux image | none (reference copy only) | — |
 | `dyn_subif_custom.py` | Customized fork of the stock single-homed script; adds VLAN exclusion + consistent route-targets | **all four leaves**, on `ethernet-1/{1..10}` (`dyn-subif` instance) | `/etc/opt/srlinux/eventmgr/` |
-| `dyn_subif_mh_custom.py` | Customized fork of the stock multi-homing script; adds the same VLAN exclusion (no route-targets — see below) | **all four leaves**, on the ES ports `ethernet-1/{11..20}` (`dyn-subif-mh` instance) | `/etc/opt/srlinux/eventmgr/` |
+| `dyn_subif_mh_custom.py` | Customized fork of the stock multi-homing script; adds the same VLAN exclusion (no route-targets — see below) | **all four leaves**, on the ES LAGs `lag{11..20}` (`dyn-subif-mh` instance) | `/etc/opt/srlinux/eventmgr/` |
 
-All leaves run the same pair of scripts so behaviour is identical fabric-wide (route-target handling via [`rt-asn`](#the-rt-asn-option-consistent-route-targets)); the `exclude-vlans` option is set on `leaf1`'s single-homed instance only. The single-homed handler owns the **full** per-VLAN lifecycle (subif + MAC-VRF + VXLAN + BGP-EVPN/BGP-VPN); the multi-homing handler creates **only the subif and its binding into a pre-existing `VLAN-<id>` MAC-VRF** — see [Multi-homing](#multi-homing-mh-clients-plain-ethernet-shared-esi).
+All leaves run the same pair of scripts so behaviour is identical fabric-wide (route-target handling via [`rt-asn`](#the-rt-asn-option-consistent-route-targets)); the `exclude-vlans` option is set on `leaf1`'s single-homed instance only. The single-homed handler owns the **full** per-VLAN lifecycle (subif + MAC-VRF + VXLAN + BGP-EVPN/BGP-VPN); the multi-homing handler creates **only the subif and its binding into a pre-existing `VLAN-<id>` MAC-VRF** — see [Multi-homing](#multi-homing-mh-clients-lacp-lag-shared-esi).
 
 ### Custom script: `dyn_subif_custom.py`
 
@@ -154,25 +154,33 @@ The excluded VLANs appear in `active-vlans` (detection happens upstream of the h
 
 ---
 
-## Multi-homing (mh-clients: plain-ethernet shared-ESI)
+## Multi-homing (mh-clients: LACP LAG shared-ESI)
 
-The `mh-client1..20` containers are dual-homed to a leaf pair (`leaf1`+`leaf2`, `leaf3`+`leaf4`) for EVPN **all-active** multi-homing. Two design choices here are load-bearing — both were needed to get dynamic-subinterface detection working on the multi-homed ports:
+The `mh-client1..20` containers are dual-homed to a leaf pair (`leaf1`+`leaf2`, `leaf3`+`leaf4`) for EVPN **all-active** multi-homing. The Ethernet Segment is an **LACP LAG**: on each leaf pair the two member ports `ethernet-1/11..20` are bundled into `lag11..20` with `lag-type lacp` and a **shared** LACP `system-id-mac` per pair (so the client sees a single aggregator), and the shared ESI + `multi-homing-mode all-active` is set on the lag. The client side is a matching **LACP `bond0` (`mode 802.3ad`)** in `dyn-vlan.clab.yml`.
 
-- **Plain ethernet, not a LACP LAG.** The Ethernet Segment (shared ESI, `multi-homing-mode all-active`) is configured directly on the member port `ethernet-1/11..20`. Active-VLAN detection does **not** fire on `lag` interfaces on this image; it does on plain ethernet. The client side is therefore a **static, LACP-less bond** (`ip link add bond0 type bond mode balance-xor` in `dyn-vlan.clab.yml`) — a "passive LAG" that stays operational against non-LACP leaf ports.
-- **No pre-provisioned `subinterface 0` on the ES port.** A static untagged subinterface on the ES port silently suppresses active-VLAN detection, so the ES ports carry *only* dynamically-created tagged subinterfaces (the single-homed ports and the shipped reference lab's ES port likewise have no static subif).
+- **No pre-provisioned `subinterface 0` on the ES lag.** A static untagged subinterface on the ES interface silently suppresses active-VLAN detection, so the ES lags carry *only* dynamically-created tagged subinterfaces (the single-homed ports and the shipped reference lab's ES port likewise have no static subif). **This — not the interface being a LAG — is the one thing that blocks detection.**
+- **`active-vlans` (and the `dyn-subif-mh` handler) live on the `lag` interface, not the member port.** Detection populates `interface lagN dynamic-subinterfaces active-vlans`; the member `ethernet-1/X` always reads empty. So the handler watches `interface lag{11..20} …` and `--mh-port` is the **lag** name.
+
+> [!NOTE]
+> The ES can equally be a plain (non-LAG) ethernet port with a static `balance-xor` client
+> bond — that's what the shipped reference lab uses, and it's the simpler form. Both were
+> verified to work; the only hard requirement is **no static `subinterface 0`** on the ES
+> interface. To switch, move the `ethernet-segment … interface` and the `dynamic-subinterfaces`
+> config onto the plain port, point the `dyn-subif-mh` handler `paths` there, and set the
+> client bond to `mode balance-xor`.
 
 ### Handler split: MH creates only the subif binding
 
-The multi-homing handler (`dyn_subif_mh_custom.py`, `dyn-subif-mh` instance, watching `interface ethernet-1/{11..20} dynamic-subinterfaces active-vlans`) creates **only** the subinterface and its `network-instance VLAN-<id> interface <port>.<id>` binding. It does **not** create the MAC-VRF, VXLAN interface, or BGP-EVPN/BGP-VPN config — those must already exist **identically on every leaf in the ES**, because traffic for a VLAN can hash to either leaf and both must land in the same EVI/VNI/RT. (This is why it carries the `exclude-vlans` option but **not** `rt-asn`: it never owns a route-target.) Pre-provision the `VLAN-<id>` MAC-VRFs before triggering — `measure_setup_rate.py --mh-client` does this for you (see [MH mode](#evpn-multi-homing-mode---mh-client)).
+The multi-homing handler (`dyn_subif_mh_custom.py`, `dyn-subif-mh` instance, watching `interface lag{11..20} dynamic-subinterfaces active-vlans`) creates **only** the subinterface and its `network-instance VLAN-<id> interface <port>.<id>` binding. It does **not** create the MAC-VRF, VXLAN interface, or BGP-EVPN/BGP-VPN config — those must already exist **identically on every leaf in the ES**, because traffic for a VLAN can hash to either leaf and both must land in the same EVI/VNI/RT. (This is why it carries the `exclude-vlans` option but **not** `rt-asn`: it never owns a route-target.) Pre-provision the `VLAN-<id>` MAC-VRFs before triggering — `measure_setup_rate.py --mh-client` does this for you (see [MH mode](#evpn-multi-homing-mode---mh-client)).
 
 ### Convergence is per-leaf: data-driven + an AD-route tail
 
-With a `balance-xor` bond the trigger frames hash to **one** leaf, which detects the VLAN from the data and provisions fast. The **other** leaf brings the VLAN up from the **BGP-EVPN AD-per-EVI route** the first leaf advertises — the control-plane path — typically a few seconds later. `measure_setup_rate.py` MH mode measures **both** ES legs, so the per-leaf `last` gap is exactly that AD-route tail:
+The LACP bond hashes each flow to **one** member link, so a given VLAN's trigger frames reach **one** leaf, which detects the VLAN from the data and provisions fast. The **other** leaf brings the VLAN up from the **BGP-EVPN AD-per-EVI route** the first leaf advertises — the control-plane path — typically a few seconds later. `measure_setup_rate.py` MH mode measures **both** ES legs, so the per-leaf `last` gap is exactly that AD-route tail:
 
 ```
 Per-leaf:
-  leaf2/ethernet-1/11 : 10/10 up   last 1.07s     <- hashed leaf: data-driven, fast
-  leaf1/ethernet-1/11 : 10/10 up   last 4.90s     <- other leaf: AD-per-EVI route tail
+  leaf2/lag11 : 10/10 up   last 3.13s     <- data-hashed leaf, provisions first
+  leaf1/lag11 : 10/10 up   last 5.23s     <- other leaf: AD-per-EVI route tail
 ```
 
 > [!IMPORTANT]
@@ -392,7 +400,7 @@ uneven `last` times or a per-interface `MISSING` line are the visible race sympt
 
 ### EVPN multi-homing mode (`--mh-client`)
 
-Measure per-leaf provisioning across an [Ethernet Segment](#multi-homing-mh-clients-plain-ethernet-shared-esi).
+Measure per-leaf provisioning across an [Ethernet Segment](#multi-homing-mh-clients-lacp-lag-shared-esi).
 One dual-homed client (its `bond0`) triggers the range; the tool first **pre-warms the
 `VLAN-<id>` MAC-VRFs on every ES leaf** (the multi-homing handler only binds into existing
 MAC-VRFs — RT `target:<rt-asn>:<evi>`, matching the single-homed handler), then measures the
@@ -401,7 +409,7 @@ data-driven leaf vs. the [AD-per-EVI route tail](#convergence-is-per-leaf-data-d
 on the other leaf. Cleanup clears retention before tearing the MAC-VRFs down.
 
 ```bash
-./measure_setup_rate.py --node leaf1 --mh-peer leaf2 --mh-port ethernet-1/11 \
+./measure_setup_rate.py --node leaf1 --mh-peer leaf2 --mh-port lag11 \
     --mh-client mh-client1 --vlans 1000-1049
 ```
 
@@ -424,16 +432,16 @@ on the other leaf. Cleanup clears retention before tearing the MAC-VRFs down.
 
 | mh-client | `--mh-port` | `--node` / `--mh-peer` |
 |-----------|-------------|------------------------|
-| `mh-client1` .. `mh-client10` | `ethernet-1/11` .. `ethernet-1/20` | `leaf1` / `leaf2` |
-| `mh-client11` .. `mh-client20` | `ethernet-1/11` .. `ethernet-1/20` | `leaf3` / `leaf4` |
+| `mh-client1` .. `mh-client10` | `lag11` .. `lag20` | `leaf1` / `leaf2` |
+| `mh-client11` .. `mh-client20` | `lag11` .. `lag20` | `leaf3` / `leaf4` |
 
 ```bash
-# leaf1+leaf2 ES, second port (mh-client2 -> ethernet-1/12):
-./measure_setup_rate.py --node leaf1 --mh-peer leaf2 --mh-port ethernet-1/12 \
+# leaf1+leaf2 ES, second port (mh-client2 -> lag12):
+./measure_setup_rate.py --node leaf1 --mh-peer leaf2 --mh-port lag12 \
     --mh-client mh-client2 --vlans 1000-1049 --settle 15 --max-wait 130
 
-# leaf3+leaf4 ES (mh-client11 -> ethernet-1/11):
-./measure_setup_rate.py --node leaf3 --mh-peer leaf4 --mh-port ethernet-1/11 \
+# leaf3+leaf4 ES (mh-client11 -> lag11):
+./measure_setup_rate.py --node leaf3 --mh-peer leaf4 --mh-port lag11 \
     --mh-client mh-client11 --vlans 1050-1099 --json-report mh.json
 ```
 

@@ -78,7 +78,7 @@ Examples:
   ./measure_setup_rate.py --node leaf1 --vlans 1000-1049 \
       --interfaces sh-client1:ethernet-1/1,sh-client2:ethernet-1/2,sh-client3:ethernet-1/3
   # EVPN multi-homing: one dual-homed client, per-leaf setup across the ES pair
-  ./measure_setup_rate.py --node leaf1 --mh-peer leaf2 --mh-port ethernet-1/11 \
+  ./measure_setup_rate.py --node leaf1 --mh-peer leaf2 --mh-port lag11 \
       --mh-client mh-client1 --vlans 1000-1049
 """
 import argparse, json, os, subprocess, sys, time
@@ -397,8 +397,10 @@ def main():
                     help="ES-partner leaf (shorthand for --mh-nodes <node>,<peer>)")
     ap.add_argument("--mh-port", default=None,
                     help="Port carrying the shared-ESI Ethernet Segment on every leaf "
-                         "(e.g. ethernet-1/11). Required in MH mode; assumed identical across "
-                         "the ES leaves.")
+                         "(e.g. lag11 in this topology, or the plain ethernet port if the ES "
+                         "is not a LAG). Required in MH mode; assumed identical across the ES "
+                         "leaves — active-vlans is read on this interface, so for a LAG use "
+                         "the lag name, not a member port.")
     ap.add_argument("--mh-client-id", type=int, default=None,
                     help="Source id for the mh-client's MAC/IP (default: mh-client trailing "
                          "digits + 20, to avoid colliding with single-homed clients)")
@@ -466,7 +468,7 @@ def main():
     if mh:
         if not args.mh_port:
             print("ERROR: --mh-port is required in MH mode (the shared-ESI port carrying "
-                  "the ES, e.g. ethernet-1/11).", file=sys.stderr)
+                  "the ES, e.g. lag11).", file=sys.stderr)
             sys.exit(1)
         if args.mh_nodes:
             mh_nodes = [n.strip() for n in args.mh_nodes.split(",") if n.strip()]
