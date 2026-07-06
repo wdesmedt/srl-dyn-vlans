@@ -264,6 +264,11 @@ def main():
                          "emulating the source vNIC going link-down (which flushes the stale "
                          "local MAC and lets EVPN mobility complete). Without this, the source "
                          "leaf keeps the VM MAC local until aging/retention and peers black-hole.")
+    ap.add_argument("--no-nudge", action="store_true",
+                    help="RARP only — disable the data-frame nudge (send_nudge) during "
+                         "source warm-up and cutover. On this SR Linux build a lone RARP "
+                         "does not reliably trigger detection / get learnt / win mobility, "
+                         "so expect warm-up and/or mobility to fail or be slow with this set.")
     ap.add_argument("--no-source-setup", action="store_true", help="assume the VM already exists on --src")
     ap.add_argument("--keep", action="store_true", help="do not delete the VM/peer sub-interfaces at the end")
     ap.add_argument("--json-report", default=None)
@@ -314,7 +319,8 @@ def main():
         # up is the active-VLAN trigger; the RARP is the frame that gets it learnt,
         # but the first RARPs are dropped during provisioning, so we sustain here.
         el, warm_rarps = announce_until_local(args.src, f"{parent}.{vlan}", mac,
-                                              src_mgmt, vlan, args.warm_timeout, args.rarp_interval)
+                                              src_mgmt, vlan, args.warm_timeout, args.rarp_interval,
+                                              nudge=not args.no_nudge)
         if el is None:
             print(f"ERROR: VM MAC never became local on {src_leaf} within {args.warm_timeout}s; "
                   f"aborting.", file=sys.stderr)
@@ -378,7 +384,8 @@ def main():
     while time.time() < deadline:
         if args.rarp_mode == "sustained" and mobility_t is None:
             send_rarp(args.dst, vif, mac, count=1)
-            send_nudge(args.dst, vif, dummy_ip(vlan))  # resumed-VM traffic — drives mobility
+            if not args.no_nudge:
+                send_nudge(args.dst, vif, dummy_ip(vlan))  # resumed-VM traffic — drives mobility
             rarps += 1
 
         if subif_up_t is None and subif_oper(dst_mgmt, dst_port, vlan) == "up":
@@ -477,6 +484,7 @@ def main():
                 "rarps_before_subif_up": rarps_before_up,
                 "subif_up_s": subif_up_t, "mac_local_s": mac_local_t,
                 "mobility_s": mobility_t, "flush_source_leaf": args.flush_source_leaf,
+                "no_nudge": args.no_nudge,
                 "src_mac_after": src_after, "peer": args.peer,
                 "peer_outage_ms": outage_ms, "peer_recovery_ms": recovery_ms,
             }, f, indent=2)
