@@ -77,6 +77,9 @@ Examples:
   # race test: same range on 3 leaf1 ports at once (cid auto-derived from client name)
   ./measure_setup_rate.py --node leaf1 --vlans 1000-1049 \
       --interfaces sh-client1:ethernet-1/1,sh-client2:ethernet-1/2,sh-client3:ethernet-1/3
+  # EVPN multi-homing: one dual-homed client, per-leaf setup across the ES pair
+  ./measure_setup_rate.py --node leaf1 --mh-peer leaf2 --mh-port ethernet-1/11 \
+      --mh-client mh-client1 --vlans 1000-1049
 """
 import argparse, json, os, subprocess, sys, time
 
@@ -264,6 +267,92 @@ def parse_interfaces(spec, default_port):
         out.append({"client": client, "port": port, "cid": cid})
     return out
 
+# --- MAC-VRF pre-warm (EVPN multi-homing mode) ------------------------------------------
+# In MH mode the multi-homing handler (dyn_subif_mh_custom.py) only binds a subinterface
+# into an already-existing VLAN-<id> MAC-VRF; it never creates the MAC-VRF/VXLAN/EVPN. The
+# ES-partner leaves have no single-homed client to create those for them, so the tool pushes
+# them itself, to EVERY leaf in the ES, just before triggering. The pushed config mirrors
+# exactly what the single-homed dyn_subif_custom.py would create (mac-vrf + vxlan0.<id> +
+# bgp-evpn evi=<vlan>/ecmp + bgp-vpn RT target:<rt-asn>:<evi>), so both models are identical
+# fabric-wide. rt-asn must match the value configured on the leaves' single-homed handler.
+RT_ASN_DEFAULT = 65535     # matches dyn_subif_custom.py RT_ASN_DEFAULT
+ECMP_VALUE = 8             # matches dyn_subif_custom.py
+UNTAGGED_EVI = 4096        # matches dyn_subif_custom.py
+UNTAGGED_VNI = 4096        # matches dyn_subif_custom.py
+NI_DESCRIPTION = "Managed by dynamic-subinterfaces (active VLAN detection)"
+
+def _macvrf_set_lines(vlan, rt_asn):
+    """`set /` CLI lines to pre-provision one VLAN-<id> MAC-VRF + vxlan0.<id>, matching
+    dyn_subif_custom.py's _actions_add_network_instance + _actions_add_vxlan_interface."""
+    name = f"VLAN-{vlan}" if vlan != 0 else "VLAN-untagged"
+    evi = vlan if vlan != 0 else UNTAGGED_EVI
+    vni = vlan if vlan != 0 else UNTAGGED_VNI
+    rt = f"target:{rt_asn}:{evi}"
+    return [
+        f"set / network-instance {name} type mac-vrf",
+        f"set / network-instance {name} admin-state enable",
+        f"set / network-instance {name} description \"{NI_DESCRIPTION}\"",
+        f"set / network-instance {name} vxlan-interface vxlan0.{vlan}",
+        f"set / network-instance {name} protocols bgp-vpn bgp-instance 1 route-target export-rt {rt}",
+        f"set / network-instance {name} protocols bgp-vpn bgp-instance 1 route-target import-rt {rt}",
+        f"set / network-instance {name} protocols bgp-evpn bgp-instance 1 admin-state enable",
+        f"set / network-instance {name} protocols bgp-evpn bgp-instance 1 vxlan-interface vxlan0.{vlan}",
+        f"set / network-instance {name} protocols bgp-evpn bgp-instance 1 evi {evi}",
+        f"set / network-instance {name} protocols bgp-evpn bgp-instance 1 ecmp {ECMP_VALUE}",
+        f"set / tunnel-interface vxlan0 vxlan-interface {vlan} type bridged",
+        f"set / tunnel-interface vxlan0 vxlan-interface {vlan} ingress vni {vni}",
+    ]
+
+def _macvrf_delete_lines(vlan):
+    """`delete /` CLI lines to tear down one pre-warmed VLAN-<id> MAC-VRF + vxlan0.<id>."""
+    name = f"VLAN-{vlan}" if vlan != 0 else "VLAN-untagged"
+    return [f"delete / network-instance {name}",
+            f"delete / tunnel-interface vxlan0 vxlan-interface {vlan}"]
+
+def srcli_commit(node, lines, timeout=120):
+    """Apply `set/delete` CLI lines on a leaf in one candidate commit via `sr_cli` stdin.
+    Returns (ok, output). Used for the MAC-VRF pre-warm/cleanup — sr_cli handles native YANG
+    types and one atomic commit, which is simpler and safer here than typing gNMI values."""
+    script = "\n".join(["enter candidate"] + lines + ["commit now", "quit"]) + "\n"
+    r = subprocess.run(["docker", "exec", "-i", node, "sr_cli"],
+                       input=script, text=True, capture_output=True, timeout=timeout)
+    out = (r.stdout or "") + (r.stderr or "")
+    ok = r.returncode == 0 and "Error" not in out and "failed" not in out.lower()
+    return ok, out
+
+def prewarm_macvrfs(nodes, vlans, rt_asn):
+    """Pre-provision VLAN-<id> MAC-VRFs for the range on every ES leaf. One commit per leaf."""
+    lines = []
+    for v in vlans:
+        lines += _macvrf_set_lines(v, rt_asn)
+    results = {}
+    for node in nodes:
+        ok, out = srcli_commit(node, lines)
+        results[node] = (ok, out)
+    return results
+
+def cleanup_macvrfs(nodes, vlans):
+    """Best-effort teardown of the pre-warmed MAC-VRFs on every ES leaf."""
+    lines = []
+    for v in vlans:
+        lines += _macvrf_delete_lines(v)
+    for node in nodes:
+        srcli_commit(node, lines)
+
+def clear_retention(node, port, vlans, timeout=120):
+    """Force the tested VLANs out of the port's active-vlans immediately via
+    `tools ... clear-retention-timer`. Without this a just-tested VLAN lingers in
+    active-vlans for the whole retention-timer; once its pre-warmed MAC-VRF is then
+    deleted, the multi-homing handler keeps trying to bind a subif into a missing
+    network-instance and — because it commits the batch atomically — poisons every
+    other VLAN on the next run. Clearing retention here drops them cleanly (the
+    handler removes the subif while the MAC-VRF still exists) before teardown."""
+    cmds = [f"tools interface {port} dynamic-subinterfaces clear-retention-timer "
+            f"active-vlan-id {v}" for v in vlans]
+    subprocess.run(["docker", "exec", "-i", node, "sr_cli"],
+                   input="\n".join(cmds) + "\n", text=True, capture_output=True,
+                   timeout=timeout)
+
 def main():
     ap = argparse.ArgumentParser(description="Measure switch-side dynamic subinterface setup rate.")
     ap.add_argument("--node", required=True, help="Leaf container name (docker)")
@@ -289,6 +378,36 @@ def main():
                          "--client/--port/--client-id. Not compatible with --dst-node.")
     ap.add_argument("--parent", default="eth1", help="Client parent interface (default eth1)")
     ap.add_argument("--keep-subifs", action="store_true", help="Do not delete the client subifs after measuring")
+    # EVPN multi-homing mode: ONE dual-homed client (static bond) triggers the range, and the
+    # same VLAN comes up on the shared-ESI port on EVERY leaf of the Ethernet Segment (locally
+    # from data on the leaf that a flow hashes to, and via the AD-per-EVI route on the other
+    # leaves). The multi-homing handler only binds into a pre-existing VLAN-<id> MAC-VRF, so
+    # the tool pre-warms those MAC-VRFs on all ES leaves first (see prewarm_macvrfs). The
+    # per-leaf subif setup across the ES pair is then measured. Enabled by --mh-client.
+    ap.add_argument("--mh-client", default=None,
+                    help="Dual-homed client container (e.g. mh-client1) to trigger. Enables "
+                         "EVPN multi-homing mode; measures per-leaf subif setup on --mh-nodes. "
+                         "Overrides --client/--interfaces. Not compatible with --dst-node.")
+    ap.add_argument("--mh-parent", default="bond0",
+                    help="Parent interface on the mh-client to build subifs on (default bond0)")
+    ap.add_argument("--mh-nodes", default=None,
+                    help="Comma-separated leaves of the Ethernet Segment to measure/pre-warm, "
+                         "e.g. 'leaf1,leaf2'. Defaults to --node plus --mh-peer if given.")
+    ap.add_argument("--mh-peer", default=None,
+                    help="ES-partner leaf (shorthand for --mh-nodes <node>,<peer>)")
+    ap.add_argument("--mh-port", default=None,
+                    help="Port carrying the shared-ESI Ethernet Segment on every leaf "
+                         "(e.g. ethernet-1/11). Required in MH mode; assumed identical across "
+                         "the ES leaves.")
+    ap.add_argument("--mh-client-id", type=int, default=None,
+                    help="Source id for the mh-client's MAC/IP (default: mh-client trailing "
+                         "digits + 20, to avoid colliding with single-homed clients)")
+    ap.add_argument("--rt-asn", type=int, default=RT_ASN_DEFAULT,
+                    help=f"Route-target administrator ASN for the pre-warmed MAC-VRFs "
+                         f"(target:<rt-asn>:<evi>); MUST match the leaves' single-homed "
+                         f"handler rt-asn option (default {RT_ASN_DEFAULT})")
+    ap.add_argument("--keep-macvrfs", action="store_true",
+                    help="Do not delete the pre-warmed MH MAC-VRFs after measuring")
     # EVPN-tail (inter-switch) measurement: also warm the same range on a destination
     # leaf/client, then time when each source MAC lands in the dst leaf's VLAN-<id> FDB
     # via BGP-EVPN. Enabled only when --dst-node is given.
@@ -325,11 +444,48 @@ def main():
         print(f"Derived gNMI mgmt IP {mgmt} for {args.node}.")
     user, pw = args.user, args.password
 
-    # Resolve the set of trigger interfaces on --node. --interfaces (multi) overrides the
-    # single-interface --client/--port/--client-id. All interfaces are on the same node and
-    # are triggered with the SAME range simultaneously to stress the event handler / active-
-    # VLAN monitor.
-    if args.interfaces:
+    # Resolve trigger sources and the leaf ports to measure. Three modes:
+    #  - single / multi (--interfaces): each entry is its own client creating subifs on its
+    #    own port on --node (many clients -> many ports on ONE leaf; the race test).
+    #  - EVPN multi-homing (--mh-client): ONE dual-homed client (bond) creates subifs on its
+    #    bond, and the SAME shared-ESI port is measured on EVERY ES leaf (--mh-nodes).
+    # `triggers` = containers to create subifs on; `measured` = leaf ports to poll/report,
+    # each carrying its own node+mgmt so the ports can live on different leaves (MH).
+    mh = bool(args.mh_client)
+    if mh and args.interfaces:
+        print("ERROR: --mh-client and --interfaces are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+    triggers = []   # {client, parent, cid}
+    measured = []   # {node, mgmt, port, cid, client, label}
+    mh_nodes = []
+    if mh:
+        if not args.mh_port:
+            print("ERROR: --mh-port is required in MH mode (the shared-ESI port carrying "
+                  "the ES, e.g. ethernet-1/11).", file=sys.stderr)
+            sys.exit(1)
+        if args.mh_nodes:
+            mh_nodes = [n.strip() for n in args.mh_nodes.split(",") if n.strip()]
+        else:
+            mh_nodes = [args.node] + ([args.mh_peer] if args.mh_peer else [])
+        if len(mh_nodes) < 2:
+            print("ERROR: MH mode needs >=2 ES leaves; pass --mh-nodes leaf1,leaf2 "
+                  "(or --node leaf1 --mh-peer leaf2).", file=sys.stderr)
+            sys.exit(1)
+        if len(set(mh_nodes)) != len(mh_nodes):
+            print(f"ERROR: duplicate node in --mh-nodes ({mh_nodes}).", file=sys.stderr)
+            sys.exit(1)
+        mh_cid = (args.mh_client_id if args.mh_client_id is not None
+                  else (derive_cid(args.mh_client) or 1) + 20)
+        triggers = [{"client": args.mh_client, "parent": args.mh_parent, "cid": mh_cid}]
+        for n in mh_nodes:
+            m = mgmt if n == args.node else docker_mgmt_ip(n)
+            if not m:
+                print(f"ERROR: could not determine gNMI mgmt IP for MH node '{n}' via "
+                      f"docker inspect.", file=sys.stderr)
+                sys.exit(1)
+            measured.append({"node": n, "mgmt": m, "port": args.mh_port, "cid": mh_cid,
+                             "client": args.mh_client, "label": f"{n}/{args.mh_port}"})
+    elif args.interfaces:
         try:
             interfaces = parse_interfaces(args.interfaces, args.port)
         except ValueError as e:
@@ -353,17 +509,24 @@ def main():
                   f"needed so source MACs/IPs don't collide — pass client:port:cid.",
                   file=sys.stderr)
             sys.exit(1)
+        for i in interfaces:
+            triggers.append({"client": i["client"], "parent": args.parent, "cid": i["cid"]})
+            measured.append({"node": args.node, "mgmt": mgmt, "port": i["port"],
+                             "cid": i["cid"], "client": i["client"], "label": i["port"]})
     else:
         if not args.client:
-            print("ERROR: --client is required (or use --interfaces).", file=sys.stderr)
+            print("ERROR: --client is required (or use --interfaces / --mh-client).",
+                  file=sys.stderr)
             sys.exit(1)
-        interfaces = [{"client": args.client, "port": args.port, "cid": args.client_id}]
+        triggers.append({"client": args.client, "parent": args.parent, "cid": args.client_id})
+        measured.append({"node": args.node, "mgmt": mgmt, "port": args.port,
+                         "cid": args.client_id, "client": args.client, "label": args.port})
 
     # EVPN-tail mode: resolve the destination leaf/client.
     evpn = bool(args.dst_node)
-    if evpn and len(interfaces) > 1:
-        print("ERROR: --dst-node (EVPN-tail) is not supported with multiple --interfaces; "
-              "run the multi-interface race test without --dst-node.", file=sys.stderr)
+    if evpn and (mh or len(measured) > 1):
+        print("ERROR: --dst-node (EVPN-tail) is not supported with multiple --interfaces or "
+              "--mh-client; run those without --dst-node.", file=sys.stderr)
         sys.exit(1)
     dst_mgmt = None
     dst_cid = None
@@ -398,7 +561,11 @@ def main():
     #     leftovers from a previous run still within retention); they share the
     #     provisioning pipeline so they may add minor contention, which we note but do not
     #     block on. --allow-active-vlans skips the check entirely.
-    check_nodes = [(args.node, mgmt)]
+    check_nodes = []
+    _seen = set()
+    for md in measured:
+        if md["node"] not in _seen:
+            _seen.add(md["node"]); check_nodes.append((md["node"], md["mgmt"]))
     if evpn:
         check_nodes.append((args.dst_node, dst_mgmt))
     vlanset = set(vlans)
@@ -423,8 +590,8 @@ def main():
         print(f"Requested range is cold (no in-range active VLANs) on "
               f"{'/'.join(n for n, _ in check_nodes)}.")
 
-    # 1b. Cold check for the specific target range on every trigger port
-    cold_targets = [(args.node, mgmt, i["port"]) for i in interfaces]
+    # 1b. Cold check for the specific target range on every measured port
+    cold_targets = [(md["node"], md["mgmt"], md["port"]) for md in measured]
     if evpn:
         cold_targets.append((args.dst_node, dst_mgmt, args.dst_port))
     for node, m, port in cold_targets:
@@ -435,10 +602,24 @@ def main():
                   f"{port} (range not cold). Use a fresh range or wait for retention.",
                   file=sys.stderr)
             sys.exit(1)
-    src_ports = ",".join(i["port"] for i in interfaces)
-    port_desc = f"{args.node} {src_ports}" + (f" + {args.dst_node} {args.dst_port}" if evpn else "")
+    port_desc = ", ".join(md["label"] for md in measured) + \
+        (f" + {args.dst_node} {args.dst_port}" if evpn else "")
     print(f"Range {vlans[0]}-{vlans[-1]} is cold on {port_desc} "
-          f"({N} VLANs x {len(interfaces)} interface(s)).")
+          f"({N} VLANs x {len(measured)} measured port(s)).")
+
+    # 1c. MH pre-warm: the multi-homing handler only binds subifs into an EXISTING VLAN-<id>
+    #     MAC-VRF, so create those on every ES leaf first (identical to what the single-homed
+    #     handler would build; RT target:<rt-asn>:<evi>). Without this the ES-partner leaf
+    #     (no single-homed client of its own) has no network-instance to bind into.
+    if mh:
+        print(f"Pre-warming {N} MAC-VRF(s) VLAN-{vlans[0]}..{vlans[-1]} (rt-asn {args.rt_asn}) "
+              f"on {', '.join(mh_nodes)} ...")
+        for node, (ok, out) in prewarm_macvrfs(mh_nodes, vlans, args.rt_asn).items():
+            if not ok:
+                print(f"ERROR: MAC-VRF pre-warm commit failed on {node}:\n"
+                      f"{out.strip()[:800]}", file=sys.stderr)
+                sys.exit(1)
+        print("MAC-VRFs pre-warmed on all ES leaves.")
 
     # 2. Build the client sub-interfaces for the range. Bringing up a tagged
     #    sub-interface is itself the active-VLAN trigger, so creating them IS the
@@ -446,32 +627,33 @@ def main():
     #    the range must NOT be pre-configured on the client (that would pre-trigger).
     #    In EVPN-tail mode the dst client is warmed too so the dst leaf provisions
     #    VLAN-<id> and can import the source MAC's Type-2 route.
-    scripts = {i["client"]: build_trigger_script(args.parent, i["cid"], vlans)
-               for i in interfaces}
+    scripts = {t["client"]: build_trigger_script(t["parent"], t["cid"], vlans)
+               for t in triggers}
     dst_script = build_trigger_script(args.parent, dst_cid, vlans) if evpn else None
     # Source MACs (EVPN-tail only, single interface): map each VLAN to the trigger MAC.
-    src_macs = {v: client_mac(interfaces[0]["cid"], v).upper() for v in vlans}
+    src_macs = {v: client_mac(triggers[0]["cid"], v).upper() for v in vlans}
 
-    # 3. Trigger + timestamp. To hit the leaf on all interfaces at once (the whole point of
-    #    the race test), spawn every client's `docker exec` first, then feed all their stdin
-    #    and let them run near-simultaneously, rather than driving them one blocking call at
-    #    a time.
+    # 3. Trigger + timestamp. To hit the fabric on all trigger clients at once, spawn every
+    #    client's `docker exec` first, then feed all their stdin and let them run near-
+    #    simultaneously, rather than driving them one blocking call at a time. (In MH mode
+    #    there is a single trigger — the dual-homed client's bond — feeding all ES leaves.)
     trigger_t = time.time()
     procs = []
-    for i in interfaces:
-        p = subprocess.Popen(["docker", "exec", "-i", i["client"], "sh"],
+    for t in triggers:
+        p = subprocess.Popen(["docker", "exec", "-i", t["client"], "sh"],
                              stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, text=True)
-        procs.append((p, i))
-    for p, i in procs:
-        p.stdin.write(scripts[i["client"]]); p.stdin.close()
-    for p, _i in procs:
+        procs.append((p, t))
+    for p, t in procs:
+        p.stdin.write(scripts[t["client"]]); p.stdin.close()
+    for p, _t in procs:
         p.wait()
     if evpn:
         subprocess.run(["docker", "exec", "-i", args.dst_client, "sh"],
                        input=dst_script, text=True, capture_output=True)
-    print(f"Triggered active-VLAN detection at t0 (created {N} client subifs on "
-          f"{len(interfaces)} interface(s){' + dst' if evpn else ''}); polling gNMI...")
+    print(f"Triggered active-VLAN detection at t0 (created {N} client subifs from "
+          f"{len(triggers)} trigger(s){' + dst' if evpn else ''}); measuring "
+          f"{len(measured)} port(s); polling gNMI...")
 
     # 4. Poll until all N requested subinterfaces are oper-up on the src leaf (and, in
     #    EVPN-tail mode, until every source MAC is type=evpn in the dst FDB). The tool is
@@ -481,15 +663,15 @@ def main():
     #    detection miss — end the run promptly instead of blocking until --max-wait.
     deadline = trigger_t + args.max_wait
     fdb_appear = {}   # vlan -> host time the src MAC first appeared in dst VLAN-<id> FDB
-    target = N * len(interfaces)  # total subifs expected across all trigger ports
-    port_up = {i["port"]: set() for i in interfaces}   # port -> set(vlan) currently oper-up
+    target = N * len(measured)  # total subifs expected across all measured ports
+    port_up = {md["label"]: set() for md in measured}  # label -> set(vlan) currently oper-up
     last_up, last_fdb = 0, 0
     last_progress_t = trigger_t
     stalled = False
     while time.time() < deadline:
-        for i in interfaces:
-            st = read_subif_state(mgmt, user, pw, i["port"])
-            port_up[i["port"]] = {v for v in vlans if st.get(v, {}).get("oper") == "up"}
+        for md in measured:
+            st = read_subif_state(md["mgmt"], user, pw, md["port"])
+            port_up[md["label"]] = {v for v in vlans if st.get(v, {}).get("oper") == "up"}
         n_up_now = sum(len(s) for s in port_up.values())
         if evpn:
             fdb = read_fdb(dst_mgmt, user, pw)
@@ -499,8 +681,9 @@ def main():
                     fdb_appear[v] = now
         if n_up_now != last_up or len(fdb_appear) != last_fdb:
             tail = f", dst-FDB {len(fdb_appear)}/{N}" if evpn else ""
-            per = ("  [" + " ".join(f"{i['port'].split('/')[-1]}:{len(port_up[i['port']])}"
-                                    for i in interfaces) + "]") if len(interfaces) > 1 else ""
+            per = ("  [" + " ".join(f"{md['node'] if mh else md['port'].split('/')[-1]}"
+                                    f"={len(port_up[md['label']])}" for md in measured) + "]") \
+                if len(measured) > 1 else ""
             print(f"  t+{time.time()-trigger_t:5.1f}s: {n_up_now}/{target} up{tail}{per}")
             last_up, last_fdb = n_up_now, len(fdb_appear)
             last_progress_t = time.time()
@@ -513,32 +696,53 @@ def main():
             break
         time.sleep(args.poll)
 
-    # 5. Final read (per port) + compute per-subif setup time relative to trigger
-    final_st = {i["port"]: read_subif_state(mgmt, user, pw, i["port"]) for i in interfaces}
+    # 5. Final read (per measured port) + compute per-subif setup time relative to trigger
+    final_st = {md["label"]: read_subif_state(md["mgmt"], user, pw, md["port"]) for md in measured}
 
-    # Clean up the client subifs (the leaf keeps its dynamic config until the
-    # retention timer expires; use a fresh range for the next measurement).
+    # Clean up the client subifs (the leaf keeps its dynamic config until the retention timer
+    # expires; use a fresh range for the next measurement). Trigger clients are unique.
     if not args.keep_subifs:
-        for client in [i["client"] for i in interfaces] + ([args.dst_client] if evpn else []):
-            subprocess.run(["docker", "exec", client, "sh", "-c",
+        seen_c = set()
+        for t in triggers:
+            if t["client"] in seen_c:
+                continue
+            seen_c.add(t["client"])
+            subprocess.run(["docker", "exec", t["client"], "sh", "-c",
+                            " ".join(f"ip link del {t['parent']}.{v} 2>/dev/null;" for v in vlans)],
+                           capture_output=True)
+        if evpn:
+            subprocess.run(["docker", "exec", args.dst_client, "sh", "-c",
                             " ".join(f"ip link del {args.parent}.{v} 2>/dev/null;" for v in vlans)],
                            capture_output=True)
+
+    # MH cleanup: first clear the tested VLANs' retention on every ES port so they leave
+    # active-vlans at once (the handler removes each dynamic subif while its MAC-VRF still
+    # exists), then tear down the pre-warmed MAC-VRFs. Order matters — deleting the MAC-VRFs
+    # while a VLAN is still active would poison the handler's atomic batch on the next run.
+    if mh:
+        for md in measured:
+            clear_retention(md["node"], md["port"], vlans)
+        if not args.keep_macvrfs:
+            time.sleep(2)  # let the handler drain the just-cleared VLANs before we drop the NIs
+            print(f"Cleaning up pre-warmed MAC-VRFs on {', '.join(mh_nodes)} ...")
+            cleanup_macvrfs(mh_nodes, vlans)
 
     def pctl(xs, p):
         xs = sorted(xs); k = (len(xs)-1)*p/100.0; lo = int(k); hi = min(lo+1, len(xs)-1)
         return xs[lo] + (xs[hi]-xs[lo])*(k-lo)
 
-    # Per-interface setup times (relative to the shared trigger) + a combined pool for the
-    # aggregate rate — the aggregate is what shows whether N ports at once still provision at
-    # the same throughput or contend/starve each other.
+    # Per-measured-port setup times (relative to the shared trigger) + a combined pool for the
+    # aggregate rate. For multi-interface this shows contention between ports on one leaf; for
+    # MH it shows whether both ES leaves bring the VLAN up together or one lags/starves.
     per_port = []
     all_ts = []
-    for i in interfaces:
-        st = final_st[i["port"]]
+    for md in measured:
+        st = final_st[md["label"]]
         s = [(v, st[v]["ts"] - trigger_t) for v in vlans if st.get(v, {}).get("ts")]
         s.sort(key=lambda x: x[1])
         up_v = set(v for v, _ in s)
-        per_port.append({"port": i["port"], "client": i["client"], "cid": i["cid"],
+        per_port.append({"port": md["port"], "node": md["node"], "label": md["label"],
+                         "client": md["client"], "cid": md["cid"],
                          "setup": s, "missing": sorted(vlanset - up_v),
                          "first": s[0][1] if s else None,
                          "last": s[-1][1] if s else None})
@@ -555,29 +759,36 @@ def main():
     ramp_rate = (n_up - 1) / spread if spread > 0 else float("inf")
     overall_rate = n_up / last if last > 0 else float("inf")
     total_missing = sum(len(p["missing"]) for p in per_port)
-    multi = len(interfaces) > 1
+    multi = len(measured) > 1
     # `setup` / `missing` kept as the single-interface view for the EVPN-tail section.
     setup = per_port[0]["setup"]
     missing = per_port[0]["missing"]
 
     print("\n" + "=" * 72)
-    scope = f"{args.node}  ({len(interfaces)} interfaces x {N} VLANs)" if multi \
-        else f"{args.node} {args.port}"
+    if mh:
+        scope = f"EVPN MULTI-HOMING — ES {'+'.join(mh_nodes)} {args.mh_port} " \
+                f"({len(measured)} leaves x {N} VLANs, trigger {args.mh_client})"
+    elif multi:
+        scope = f"{args.node}  ({len(measured)} interfaces x {N} VLANs)"
+    else:
+        scope = f"{args.node} {args.port}"
     print(f"SWITCH-SIDE SETUP RATE — {scope}")
     print("=" * 72)
     if multi:
-        # Per-interface breakdown first: uneven last-times or per-port missing VLANs are the
-        # visible symptom of a race between the event handler and the active-VLAN monitor.
-        print("Per-interface:")
+        # Per-port breakdown first. For multi-interface: uneven last-times / per-port missing
+        # VLANs are a race symptom between the handler and the active-VLAN monitor. For MH:
+        # they show whether both ES leaves converge together or one leaf lags/starves (e.g.
+        # the AD-per-EVI-driven leaf trailing the data-driven one).
+        print("Per-leaf:" if mh else "Per-interface:")
         for p in per_port:
             miss = (f"   MISSING {len(p['missing'])}: {p['missing'][:6]}"
                     f"{' ...' if len(p['missing']) > 6 else ''}") if p["missing"] else ""
             fu = f"{p['first']:.2f}" if p["first"] is not None else "  -  "
             lu = f"{p['last']:.2f}" if p["last"] is not None else "  -  "
-            print(f"  {p['port']:<14} {p['client']:<12} : "
-                  f"{len(p['setup'])}/{N} up   first {fu}s  last {lu}s{miss}")
+            tag = p["label"] if mh else f"{p['port']:<14} {p['client']:<12}"
+            print(f"  {tag:<27} : {len(p['setup'])}/{N} up   first {fu}s  last {lu}s{miss}")
         print("-" * 72)
-        print("Aggregate (all interfaces):")
+        print("Aggregate (all ES leaves):" if mh else "Aggregate (all interfaces):")
     print(f"Subifs requested       : {target}")
     print(f"Sub-interfaces up      : {n_up}")
     if total_missing:
@@ -620,18 +831,22 @@ def main():
         print("=" * 72)
 
     if args.json_report:
-        report = {"node": args.node, "num_vlans": N,
-                  "num_interfaces": len(interfaces), "subifs_requested": target,
+        report = {"node": args.node, "mode": "mh" if mh else ("multi" if multi else "single"),
+                  "num_vlans": N, "num_ports": len(measured), "subifs_requested": target,
                   "n_up": n_up, "not_provisioned": total_missing, "stalled": stalled,
                   "first_s": first, "last_s": last,
                   "ramp_rate": ramp_rate, "overall_rate": overall_rate,
                   "interfaces": [
-                      {"port": p["port"], "client": p["client"], "cid": p["cid"],
+                      {"node": p["node"], "port": p["port"], "label": p["label"],
+                       "client": p["client"], "cid": p["cid"],
                        "n_up": len(p["setup"]), "missing": p["missing"],
                        "first_s": p["first"], "last_s": p["last"],
                        "setup_s": {v: t for v, t in p["setup"]}}
                       for p in per_port]}
-        # Back-compat single-interface fields (first trigger port).
+        if mh:
+            report.update({"mh_client": args.mh_client, "mh_nodes": mh_nodes,
+                           "mh_port": args.mh_port, "rt_asn": args.rt_asn})
+        # Back-compat single-port fields (first measured port).
         report["port"] = per_port[0]["port"]
         report["setup_s"] = {v: t for v, t in per_port[0]["setup"]}
         if evpn:

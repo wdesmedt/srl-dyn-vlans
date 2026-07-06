@@ -18,18 +18,22 @@ topology:
       kind: nokia_srlinux
       binds:
         - ./dyn_subif_custom.py:/etc/opt/srlinux/eventmgr/dyn_subif_custom.py
+        - ./dyn_subif_mh_custom.py:/etc/opt/srlinux/eventmgr/dyn_subif_mh_custom.py
     leaf2:
       kind: nokia_srlinux
       binds:
         - ./dyn_subif_custom.py:/etc/opt/srlinux/eventmgr/dyn_subif_custom.py
+        - ./dyn_subif_mh_custom.py:/etc/opt/srlinux/eventmgr/dyn_subif_mh_custom.py
     leaf3:
       kind: nokia_srlinux
       binds:
         - ./dyn_subif_custom.py:/etc/opt/srlinux/eventmgr/dyn_subif_custom.py
+        - ./dyn_subif_mh_custom.py:/etc/opt/srlinux/eventmgr/dyn_subif_mh_custom.py
     leaf4:
       kind: nokia_srlinux
       binds:
         - ./dyn_subif_custom.py:/etc/opt/srlinux/eventmgr/dyn_subif_custom.py
+        - ./dyn_subif_mh_custom.py:/etc/opt/srlinux/eventmgr/dyn_subif_mh_custom.py
 
     sh-client1:
       kind: linux
@@ -116,7 +120,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -128,7 +132,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -140,7 +144,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -152,7 +156,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -164,7 +168,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -176,7 +180,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -188,7 +192,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -200,7 +204,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -212,7 +216,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -224,7 +228,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -236,7 +240,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -248,7 +252,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -260,7 +264,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -272,7 +276,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -284,7 +288,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -296,7 +300,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -308,7 +312,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -320,7 +324,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -332,7 +336,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
@@ -344,7 +348,7 @@ topology:
       exec:
         - ip link set dev eth1 down
         - ip link set dev eth2 down
-        - ip link add name bond0 type bond mode 802.3ad
+        - ip link add name bond0 type bond mode balance-xor
         - ip link set dev bond0 up
         - ip link set dev eth1 master bond0
         - ip link set dev eth2 master bond0
