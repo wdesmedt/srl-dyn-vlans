@@ -231,6 +231,31 @@ Key options: `--rarp-mode {once,burst,sustained}` (default `sustained`); `--peer
 
 ## Installation & Setup
 
+### Talking to the leaves (real hardware)
+
+The measurement tools (`measure_setup_rate.py`, `vmotion.py`) reach the SR Linux nodes over
+their **management plane, not docker**, so they work against real hardware as well as the lab:
+
+- **gNMI** (`gnmic`, port 57400, `--skip-verify`) for all reads.
+- **SSH** (`ssh` + `sshpass`, port 22) into `sr_cli` for config changes and `tools` actions.
+- Credentials default to `admin` / `NokiaSrl1!` (override with `--user`/`--password` or env
+  `SRL_USER`/`SRL_PASSWORD`).
+
+A leaf **name** (`--node leaf1`, `--mh-peer leaf2`, `--dst-node`, …) is resolved to a
+management address by [srl_node.py](file:///home/wds/github/srl-dyn-vlans/srl_node.py) in this order:
+
+1. env `SRL_ADDR_<name>` (e.g. `export SRL_ADDR_leaf1=10.0.0.11`),
+2. a whitespace `name  address` inventory file pointed to by env `SRL_INVENTORY`,
+3. the name itself (must be DNS/hosts-resolvable, or already an IP).
+
+Host requirements: `gnmic`, `ssh`, `sshpass` on `PATH` (`sudo apt install sshpass`). Only the
+SR Linux node access moved off docker — the tools still drive the traffic-source **clients**
+with `docker exec` (in the lab those are containers; adapt that side for your own hosts).
+
+> [!NOTE]
+> In the clab lab the node names aren't directly routable, so export the container mgmt IPs
+> once, e.g. `for n in leaf1 leaf2 leaf3 leaf4; do export SRL_ADDR_$n=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $n); done`.
+
 ### 1. Deploy the Topology
 Deploy the network fabric using [containerlab](https://containerlab.dev/):
 ```bash
@@ -363,7 +388,11 @@ which triggers active-VLAN detection on a cold range and reads each sub-interfac
 ```bash
 ./measure_setup_rate.py --node leaf1 --client sh-client1 --vlans 1100-1199
 ```
-The leaf's gNMI management IP is derived automatically from `--node` via `docker inspect`; pass `--leaf-mgmt` only to override it.
+The leaf is reached over its **management plane, not docker** — gNMI (`gnmic`, port 57400)
+for reads and SSH (`ssh` + `sshpass`, port 22) into `sr_cli` for config (mac-vrf pre-warm,
+cleanup, `tools` actions). See [Talking to the leaves](#talking-to-the-leaves-real-hardware)
+for how `--node <name>` resolves to a management address. Pass `--leaf-mgmt` to override the
+address for `--node` directly.
 
 Although the tool only reads the **subinterface** `last-change`, the number it reports is
 the full **subif + MAC-VRF + VXLAN** provisioning rate: the event handler creates all

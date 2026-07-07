@@ -22,7 +22,10 @@ outage seen by a stationary peer that keeps pinging the VM across the move.
 Topology assumptions (this lab): single-homed sh-clientN ->
   N in 1..10  -> leaf1  ethernet-1/N
   N in 11..20 -> leaf3  ethernet-1/(N-10)
-Leaf gNMI mgmt IPs are derived from the container name via docker inspect.
+Leaf access is over gNMI+SSH (not docker): the leaf name is resolved to a management
+address via env SRL_ADDR_<node> / an SRL_INVENTORY file / the name itself, and reached
+with admin/NokiaSrl1! (see srl_node.py). Requires `gnmic`, `ssh`, `sshpass` on the host.
+The src/dst/peer clients are still driven with `docker exec`.
 
 Example (cross-leaf move, leaf1 -> leaf3, stationary peer on leaf1):
   ./vmotion.py --vlan 1055 --src sh-client1 --dst sh-client11 --peer sh-client5
@@ -36,6 +39,8 @@ import subprocess
 import sys
 import time
 
+import srl_node   # SSH (sr_cli) + gNMI (gnmic) transport to SR Linux nodes (no docker)
+
 USER = "admin"
 PASSWORD = "NokiaSrl1!"
 GNMI_PORT = 57400
@@ -48,30 +53,14 @@ def sh(cmd, timeout=60, text_input=None):
     return r.returncode, r.stdout, r.stderr
 
 
-def docker_mgmt_ip(node):
-    code, out, _ = sh(["docker", "inspect", "-f",
-                       "{{range .NetworkSettings.Networks}}{{.IPAddress}}\n{{end}}", node])
-    if code != 0:
-        return None
-    for line in out.splitlines():
-        ip = line.strip()
-        if ip:
-            return ip
-    return None
+def node_addr(node):
+    """Management host/IP for a leaf name (env SRL_ADDR_<node> / inventory / the name)."""
+    return srl_node.node_addr(node)
 
 
 def gnmic_get(mgmt, paths, datatype="state"):
-    cmd = ["gnmic", "-a", f"{mgmt}:{GNMI_PORT}", "-u", USER, "-p", PASSWORD, "--skip-verify",
-           "-e", "json_ietf", "get", "--type", datatype]
-    for p in paths:
-        cmd += ["--path", p]
-    code, out, _ = sh(cmd)
-    if code != 0:
-        return None
-    try:
-        return json.loads(out)
-    except Exception:
-        return None
+    """gNMI GET against a leaf's management address (mgmt = host/IP), via gnmic."""
+    return srl_node.gnmi_get(None, paths, user=USER, pw=PASSWORD, host=mgmt, datatype=datatype)
 
 
 def _first_value(data):
@@ -168,15 +157,10 @@ def flush_source_leaf_subif(leaf, port, vlan):
     EVPN mobility can complete; the dynamic sub-interface would otherwise persist
     (and keep the MAC local) until the retention timer expires."""
     ni = f"VLAN-{vlan}"
-    script = "\n".join([
-        "enter candidate",
+    srl_node.commit(leaf, [
         f"delete network-instance {ni} interface {port}.{vlan}",
         f"delete interface {port} subinterface {vlan}",
-        "commit stay",
-        "quit",
-        "",
-    ])
-    sh(["docker", "exec", "-i", leaf, "sr_cli"], text_input=script)
+    ], user=USER, pw=PASSWORD)
 
 
 def push_rarp_agent(client):
@@ -254,7 +238,9 @@ def main():
     ap.add_argument("--rarp-mode", choices=["once", "burst", "sustained"], default="sustained",
                     help="once: 1 RARP at cutover; burst: --rarp-count RARPs; "
                          "sustained: keep announcing until the MAC moves (default)")
-    ap.add_argument("--rarp-count", type=int, default=5, help="RARPs for --rarp-mode burst (default 5)")
+    ap.add_argument("--rarp-count", type=int, default=None,
+                    help="Number of RARPs to send — ONLY used with --rarp-mode burst "
+                         "(default 5). Ignored in once/sustained mode.")
     ap.add_argument("--rarp-interval", type=float, default=0.2, help="seconds between RARPs in sustained/burst (default 0.2)")
     ap.add_argument("--timeout", type=float, default=20.0, help="give up waiting for MAC move after this many s")
     ap.add_argument("--poll", type=float, default=0.3, help="leaf gNMI poll interval (s)")
@@ -274,6 +260,14 @@ def main():
     ap.add_argument("--json-report", default=None)
     args = ap.parse_args()
 
+    # --rarp-count only feeds burst mode; warn rather than silently ignore it elsewhere.
+    rarp_count = args.rarp_count if args.rarp_count is not None else 5
+    if args.rarp_count is not None and args.rarp_mode != "burst":
+        print(f"WARNING: --rarp-count is only used with --rarp-mode burst; ignored in "
+              f"'{args.rarp_mode}' mode (the default is sustained, which announces until the "
+              f"MAC moves). Add --rarp-mode burst to send exactly {args.rarp_count}.",
+              file=sys.stderr)
+
     vlan = args.vlan
     mac = args.vm_mac or default_vm_mac(vlan)
     ip = args.vm_ip or vm_ip(vlan)
@@ -281,8 +275,8 @@ def main():
 
     src_leaf, src_port, _ = client_location(args.src)
     dst_leaf, dst_port, _ = client_location(args.dst)
-    src_mgmt = docker_mgmt_ip(src_leaf)
-    dst_mgmt = docker_mgmt_ip(dst_leaf)
+    src_mgmt = node_addr(src_leaf)
+    dst_mgmt = node_addr(dst_leaf)
     if not src_mgmt or not dst_mgmt:
         print(f"ERROR: could not resolve leaf mgmt IPs ({src_leaf}={src_mgmt}, {dst_leaf}={dst_mgmt})", file=sys.stderr)
         sys.exit(1)
@@ -298,205 +292,209 @@ def main():
         pip = peer_ip(vlan, peer_id)
         print(f"Peer (static) : {args.peer}  ->  {peer_leaf} {peer_port}  ip={pip}")
     print(f"RARP mode     : {args.rarp_mode}"
-          + (f" (count={args.rarp_count})" if args.rarp_mode == "burst" else "")
+          + (f" (count={rarp_count})" if args.rarp_mode == "burst" else "")
           + (f" (interval={args.rarp_interval}s)" if args.rarp_mode != "once" else ""))
     print("=" * 74)
 
-    push_rarp_agent(args.dst)
+    # Every eth1.<vlan> this run creates (on src/dst/peer) is torn down in the finally
+    # below, so an early exit (warm-up timeout, bad --vlan, Ctrl-C, exception) never
+    # strands a client subinterface for a later run to trip over.
+    created_clients = [c for c in [args.src, args.dst, args.peer] if c]
+    try:
+        push_rarp_agent(args.dst)
 
-    # Warn if the target VLAN is already warm on the target leaf (not a true
-    # "VLAN doesn't exist yet" demonstration).
-    if subif_oper(dst_mgmt, dst_port, vlan) is not None:
-        print(f"WARNING: subinterface {dst_port}.{vlan} already exists on {dst_leaf} "
-              f"(target not cold) — dynamic creation will not be exercised.", file=sys.stderr)
+        # Warn if the target VLAN is already warm on the target leaf (not a true
+        # "VLAN doesn't exist yet" demonstration).
+        if subif_oper(dst_mgmt, dst_port, vlan) is not None:
+            print(f"WARNING: subinterface {dst_port}.{vlan} already exists on {dst_leaf} "
+                  f"(target not cold) — dynamic creation will not be exercised.", file=sys.stderr)
 
-    # ---- Phase A: place + warm the VM on the source ------------------------------------
-    if not args.no_source_setup:
-        push_rarp_agent(args.src)
-        print(f"[setup] Placing VM on source {args.src} ({src_leaf} {src_port})...")
-        create_subif(args.src, parent, vlan, mac, ip)
-        # Announce until the source leaf learns the MAC locally. Bringing the subif
-        # up is the active-VLAN trigger; the RARP is the frame that gets it learnt,
-        # but the first RARPs are dropped during provisioning, so we sustain here.
-        el, warm_rarps = announce_until_local(args.src, f"{parent}.{vlan}", mac,
-                                              src_mgmt, vlan, args.warm_timeout, args.rarp_interval,
-                                              nudge=not args.no_nudge)
-        if el is None:
-            print(f"ERROR: VM MAC never became local on {src_leaf} within {args.warm_timeout}s; "
-                  f"aborting.", file=sys.stderr)
-            sys.exit(1)
-        print(f"[setup] VM learnt locally on {src_leaf} after {el:.2f}s ({warm_rarps} RARPs).")
+        # ---- Phase A: place + warm the VM on the source ------------------------------------
+        if not args.no_source_setup:
+            push_rarp_agent(args.src)
+            print(f"[setup] Placing VM on source {args.src} ({src_leaf} {src_port})...")
+            create_subif(args.src, parent, vlan, mac, ip)
+            # Announce until the source leaf learns the MAC locally. Bringing the subif
+            # up is the active-VLAN trigger; the RARP is the frame that gets it learnt,
+            # but the first RARPs are dropped during provisioning, so we sustain here.
+            el, warm_rarps = announce_until_local(args.src, f"{parent}.{vlan}", mac,
+                                                  src_mgmt, vlan, args.warm_timeout, args.rarp_interval,
+                                                  nudge=not args.no_nudge)
+            if el is None:
+                print(f"ERROR: VM MAC never became local on {src_leaf} within {args.warm_timeout}s; "
+                      f"aborting.", file=sys.stderr)
+                sys.exit(1)
+            print(f"[setup] VM learnt locally on {src_leaf} after {el:.2f}s ({warm_rarps} RARPs).")
 
-    # ---- Phase B: place + warm the stationary peer -------------------------------------
-    if args.peer:
-        peer_leaf, peer_port, peer_id = client_location(args.peer)
-        pip = peer_ip(vlan, peer_id)
-        print(f"[setup] Placing peer {args.peer} ({peer_leaf} {peer_port})...")
-        create_subif(args.peer, parent, vlan, peer_id_to_mac(peer_id, vlan), pip)
-        # Warm the peer's path to the VM (resolve ARP) so the pre-move baseline is clean.
-        sh(["docker", "exec", args.peer, "ping", "-n", "-c", "3", "-i", "0.2", "-w", "5", ip])
-        pe = mac_entry(peer_leaf and docker_mgmt_ip(peer_leaf), vlan, mac)
-        print(f"[setup] Peer path warm (VM seen on peer leaf as: "
-              f"{pe.get('destination-type') if pe else 'unknown'}).")
-
-    # ---- Phase C: start the peer's continuous ping across the move ---------------------
-    ping_interval = 0.1
-    if args.peer:
-        window = args.warm_timeout + args.timeout + 5.0
-        cnt = int(window / ping_interval)
-        start_peer_ping(args.peer, ip, cnt, ping_interval)
-        time.sleep(1.0)  # baseline samples before cutover
-
-    # ---- Phase D: cutover --------------------------------------------------------------
-    print("-" * 74)
-    print(f"[cutover] Moving VM {mac} : {args.src} ({src_leaf}) -> {args.dst} ({dst_leaf})")
-    t0 = time.time()
-    delete_subif(args.src, parent, vlan)          # VM leaves the source host
-    if args.flush_source_leaf:
-        flush_source_leaf_subif(src_leaf, src_port, vlan)  # emulate source vNIC link-down
-    create_subif(args.dst, parent, vlan, mac, ip)  # VM appears on target (triggers detection)
-    vif = f"{parent}.{vlan}"
-
-    initial = 0
-    if args.rarp_mode == "once":
-        send_rarp(args.dst, vif, mac, count=1)
-        initial = 1
-    elif args.rarp_mode == "burst":
-        send_rarp(args.dst, vif, mac, count=args.rarp_count, interval=args.rarp_interval)
-        initial = args.rarp_count
-    print(f"[cutover] VM re-created on target; RARP announcement started (mode={args.rarp_mode}).")
-
-    # One loop tracks target provisioning (subif up, MAC learnt local) AND source-leaf
-    # mobility (source stops claiming the VM local) — while the moved VM keeps announcing
-    # the WHOLE time. This models a real migrated VM: it resumes and keeps sending, and
-    # that continuous traffic is what drives EVPN mobility to converge. If we instead stop
-    # at the first target-learn (as an earlier version did), the moved VM goes silent, its
-    # target-local entry is not reinforced, and the source leaf's stale (still-aging) local
-    # entry wins the mobility arbitration — so the target yields to remote and the move
-    # never propagates (both leaves point back to the source). Keep talking until the
-    # source leaf releases the MAC (mobility_t) or we time out.
-    subif_up_t = None
-    mac_local_t = None
-    mobility_t = None
-    rarps = initial
-    rarps_before_up = None
-    deadline = t0 + args.timeout
-    while time.time() < deadline:
-        if args.rarp_mode == "sustained" and mobility_t is None:
-            send_rarp(args.dst, vif, mac, count=1)
-            if not args.no_nudge:
-                send_nudge(args.dst, vif, dummy_ip(vlan))  # resumed-VM traffic — drives mobility
-            rarps += 1
-
-        if subif_up_t is None and subif_oper(dst_mgmt, dst_port, vlan) == "up":
-            subif_up_t = time.time() - t0
-            rarps_before_up = rarps
-
-        if mac_local_t is None:
-            e = mac_entry(dst_mgmt, vlan, mac)
-            if e and e.get("destination-type") == "sub-interface":
-                mac_local_t = time.time() - t0
-
-        # Source-leaf mobility can only complete once the target holds the MAC local.
-        if mac_local_t is not None and mobility_t is None:
-            se = mac_entry(src_mgmt, vlan, mac)
-            if se is None or se.get("destination-type") != "sub-interface":
-                mobility_t = time.time() - t0
-                break
-
-        time.sleep(args.poll if args.rarp_mode != "sustained" else max(0.0, args.rarp_interval - 0.05))
-
-    # ---- Phase E: settle + collect the peer outage -------------------------------------
-    src_after = mac_entry(src_mgmt, vlan, mac)
-    outage_ms = None
-    recovery_ms = None
-    if args.peer:
-        # Let the dataplane settle so post-convergence replies are actually captured
-        # (control-plane mobility completing does not instantly mean the first ICMP
-        # reply has been seen), then stop the pinger and parse.
-        time.sleep(3.0)
-        sh(["docker", "exec", args.peer, "pkill", "-INT", "-f", "ping -n -D"])
-        ts = collect_peer_ping(args.peer)
-        if len(ts) >= 2:
-            gaps = [(ts[i + 1] - ts[i]) for i in range(len(ts) - 1)]
-            outage_ms = max(gaps) * 1000.0
-            after = [t for t in ts if t > t0]
-            if after:
-                recovery_ms = (min(after) - t0) * 1000.0
-            else:
-                recovery_ms = None  # never recovered within the window
-
-    # ---- Report ------------------------------------------------------------------------
-    print("=" * 74)
-    print("RESULT")
-    print("=" * 74)
-    print(f"Target subif up (t0+)     : {fmt(subif_up_t)} s")
-    print(f"VM MAC local on target    : {fmt(mac_local_t)} s")
-    print(f"RARPs sent (total)        : {rarps}")
-    if rarps_before_up is not None:
-        print(f"RARPs before subif existed: {rarps_before_up}  (dropped — trigger-only, not forwardable)")
-    print(f"MAC mobility on src leaf  : "
-          + (f"released at t0+{mobility_t:.2f}s" if mobility_t is not None
-             else "NOT released (source leaf still claims VM local)"))
-    print(f"Source leaf MAC after move: "
-          + (f"{src_after.get('type')} / {src_after.get('destination-type')} "
-             f"({src_after.get('destination')})" if src_after else "absent"))
-    if args.peer:
-        print(f"Peer max outage           : {fmt_ms(outage_ms)}")
-        print(f"Peer recovery (t0+)       : {fmt_ms(recovery_ms) if recovery_ms is not None else 'NEVER (within window)'}")
-    print("-" * 74)
-    print("VERDICT")
-    # Two independent conditions must both hold for a peer to follow the VM:
-    #   1. target provisioning: subif/MAC-VRF up and VM MAC learnt local on target
-    #   2. fabric mobility: the source leaf stops claiming the VM as local
-    if mac_local_t is None:
-        print(f"  TARGET NOT PROVISIONED. After {rarps} RARP(s) (mode={args.rarp_mode}) the VM MAC never")
-        print(f"  became local on {dst_leaf} within {args.timeout:.0f}s. The RARP(s) hit the port before the")
-        print(f"  sub-interface/MAC-VRF were provisioned (subif up at {fmt(subif_up_t)}s) and were consumed")
-        print(f"  as the active-VLAN trigger, not forwarded. A single/burst RARP is NOT sufficient — use")
-        print(f"  sustained announcement (or continued VM traffic) spanning the provisioning window.")
-    elif mobility_t is None:
-        print(f"  TARGET UP BUT MOVE DID NOT PROPAGATE within {args.timeout:.0f}s. VM MAC is local on")
-        print(f"  {dst_leaf} at t0+{mac_local_t:.2f}s, but {src_leaf} still claims it local (aging, not")
-        print(f"  yet expired), so peers via {src_leaf} keep black-holing. The moved VM must keep sourcing")
-        print(f"  traffic to win EVPN mobility — if it goes quiet, {src_leaf}'s stale local entry wins and")
-        print(f"  the target yields to remote. Ensure sustained announcement is running (--rarp-mode")
-        print(f"  sustained, the default) and raise --timeout; a real VM keeps sending and converges in")
-        print(f"  a few seconds. (Also verify route-targets match across leaves — auto RT = local-ASN:EVI")
-        print(f"  differs per leaf under an eBGP overlay; the handler pins it. --flush-source-leaf forces")
-        print(f"  it but is NOT realistic — an ESXi trunk stays up when one VM leaves.)")
-    else:
-        print(f"  CONVERGED. Target learnt the VM at t0+{mac_local_t:.2f}s and the source leaf released it")
-        print(f"  (EVPN mobility) at t0+{mobility_t:.2f}s.")
-        if rarps_before_up:
-            print(f"  Note: {rarps_before_up} of {rarps} RARPs were emitted before the sub-interface existed")
-            print(f"  (up at t0+{fmt(subif_up_t)}s) and were dropped — a real single-shot vMotion RARP would")
-            print(f"  have been lost; sustained announcement is what carried the trigger here.")
-    print("=" * 74)
-
-    if args.json_report:
-        with open(args.json_report, "w") as f:
-            json.dump({
-                "vlan": vlan, "vm_mac": mac, "vm_ip": ip,
-                "src": args.src, "src_leaf": src_leaf, "src_port": src_port,
-                "dst": args.dst, "dst_leaf": dst_leaf, "dst_port": dst_port,
-                "rarp_mode": args.rarp_mode, "rarps_total": rarps,
-                "rarps_before_subif_up": rarps_before_up,
-                "subif_up_s": subif_up_t, "mac_local_s": mac_local_t,
-                "mobility_s": mobility_t, "flush_source_leaf": args.flush_source_leaf,
-                "no_nudge": args.no_nudge,
-                "src_mac_after": src_after, "peer": args.peer,
-                "peer_outage_ms": outage_ms, "peer_recovery_ms": recovery_ms,
-            }, f, indent=2)
-        print(f"Wrote {args.json_report}")
-
-    # ---- cleanup -----------------------------------------------------------------------
-    if not args.keep:
-        delete_subif(args.dst, parent, vlan)
+        # ---- Phase B: place + warm the stationary peer -------------------------------------
         if args.peer:
-            delete_subif(args.peer, parent, vlan)
-        # source subif was already removed at cutover
-        print("Cleaned up VM/peer sub-interfaces (leaf dynamic config self-clears via retention timer).")
+            peer_leaf, peer_port, peer_id = client_location(args.peer)
+            pip = peer_ip(vlan, peer_id)
+            print(f"[setup] Placing peer {args.peer} ({peer_leaf} {peer_port})...")
+            create_subif(args.peer, parent, vlan, peer_id_to_mac(peer_id, vlan), pip)
+            # Warm the peer's path to the VM (resolve ARP) so the pre-move baseline is clean.
+            sh(["docker", "exec", args.peer, "ping", "-n", "-c", "3", "-i", "0.2", "-w", "5", ip])
+            pe = mac_entry(peer_leaf and node_addr(peer_leaf), vlan, mac)
+            print(f"[setup] Peer path warm (VM seen on peer leaf as: "
+                  f"{pe.get('destination-type') if pe else 'unknown'}).")
+
+        # ---- Phase C: start the peer's continuous ping across the move ---------------------
+        ping_interval = 0.1
+        if args.peer:
+            window = args.warm_timeout + args.timeout + 5.0
+            cnt = int(window / ping_interval)
+            start_peer_ping(args.peer, ip, cnt, ping_interval)
+            time.sleep(1.0)  # baseline samples before cutover
+
+        # ---- Phase D: cutover --------------------------------------------------------------
+        print("-" * 74)
+        print(f"[cutover] Moving VM {mac} : {args.src} ({src_leaf}) -> {args.dst} ({dst_leaf})")
+        t0 = time.time()
+        delete_subif(args.src, parent, vlan)          # VM leaves the source host
+        if args.flush_source_leaf:
+            flush_source_leaf_subif(src_leaf, src_port, vlan)  # emulate source vNIC link-down
+        create_subif(args.dst, parent, vlan, mac, ip)  # VM appears on target (triggers detection)
+        vif = f"{parent}.{vlan}"
+
+        initial = 0
+        if args.rarp_mode == "once":
+            send_rarp(args.dst, vif, mac, count=1)
+            initial = 1
+        elif args.rarp_mode == "burst":
+            send_rarp(args.dst, vif, mac, count=rarp_count, interval=args.rarp_interval)
+            initial = rarp_count
+        print(f"[cutover] VM re-created on target; RARP announcement started (mode={args.rarp_mode}).")
+
+        # One loop tracks target provisioning (subif up, MAC learnt local) AND source-leaf
+        # mobility (source stops claiming the VM local) — while the moved VM keeps announcing
+        # the WHOLE time. This models a real migrated VM: it resumes and keeps sending, and
+        # that continuous traffic is what drives EVPN mobility to converge. If we instead stop
+        # at the first target-learn (as an earlier version did), the moved VM goes silent, its
+        # target-local entry is not reinforced, and the source leaf's stale (still-aging) local
+        # entry wins the mobility arbitration — so the target yields to remote and the move
+        # never propagates (both leaves point back to the source). Keep talking until the
+        # source leaf releases the MAC (mobility_t) or we time out.
+        subif_up_t = None
+        mac_local_t = None
+        mobility_t = None
+        rarps = initial
+        rarps_before_up = None
+        deadline = t0 + args.timeout
+        while time.time() < deadline:
+            if args.rarp_mode == "sustained" and mobility_t is None:
+                send_rarp(args.dst, vif, mac, count=1)
+                if not args.no_nudge:
+                    send_nudge(args.dst, vif, dummy_ip(vlan))  # resumed-VM traffic — drives mobility
+                rarps += 1
+
+            if subif_up_t is None and subif_oper(dst_mgmt, dst_port, vlan) == "up":
+                subif_up_t = time.time() - t0
+                rarps_before_up = rarps
+
+            if mac_local_t is None:
+                e = mac_entry(dst_mgmt, vlan, mac)
+                if e and e.get("destination-type") == "sub-interface":
+                    mac_local_t = time.time() - t0
+
+            # Source-leaf mobility can only complete once the target holds the MAC local.
+            if mac_local_t is not None and mobility_t is None:
+                se = mac_entry(src_mgmt, vlan, mac)
+                if se is None or se.get("destination-type") != "sub-interface":
+                    mobility_t = time.time() - t0
+                    break
+
+            time.sleep(args.poll if args.rarp_mode != "sustained" else max(0.0, args.rarp_interval - 0.05))
+
+        # ---- Phase E: settle + collect the peer outage -------------------------------------
+        src_after = mac_entry(src_mgmt, vlan, mac)
+        outage_ms = None
+        recovery_ms = None
+        if args.peer:
+            # Let the dataplane settle so post-convergence replies are actually captured
+            # (control-plane mobility completing does not instantly mean the first ICMP
+            # reply has been seen), then stop the pinger and parse.
+            time.sleep(3.0)
+            sh(["docker", "exec", args.peer, "pkill", "-INT", "-f", "ping -n -D"])
+            ts = collect_peer_ping(args.peer)
+            if len(ts) >= 2:
+                gaps = [(ts[i + 1] - ts[i]) for i in range(len(ts) - 1)]
+                outage_ms = max(gaps) * 1000.0
+                after = [t for t in ts if t > t0]
+                if after:
+                    recovery_ms = (min(after) - t0) * 1000.0
+                else:
+                    recovery_ms = None  # never recovered within the window
+
+        # ---- Report ------------------------------------------------------------------------
+        print("=" * 74)
+        print("RESULT")
+        print("=" * 74)
+        print(f"Target subif up (t0+)     : {fmt(subif_up_t)} s")
+        print(f"VM MAC local on target    : {fmt(mac_local_t)} s")
+        print(f"RARPs sent (total)        : {rarps}")
+        if rarps_before_up is not None:
+            print(f"RARPs before subif existed: {rarps_before_up}  (dropped — trigger-only, not forwardable)")
+        print(f"MAC mobility on src leaf  : "
+              + (f"released at t0+{mobility_t:.2f}s" if mobility_t is not None
+                 else "NOT released (source leaf still claims VM local)"))
+        print(f"Source leaf MAC after move: "
+              + (f"{src_after.get('type')} / {src_after.get('destination-type')} "
+                 f"({src_after.get('destination')})" if src_after else "absent"))
+        if args.peer:
+            print(f"Peer max outage           : {fmt_ms(outage_ms)}")
+            print(f"Peer recovery (t0+)       : {fmt_ms(recovery_ms) if recovery_ms is not None else 'NEVER (within window)'}")
+        print("-" * 74)
+        print("VERDICT")
+        # Two independent conditions must both hold for a peer to follow the VM:
+        #   1. target provisioning: subif/MAC-VRF up and VM MAC learnt local on target
+        #   2. fabric mobility: the source leaf stops claiming the VM as local
+        if mac_local_t is None:
+            print(f"  TARGET NOT PROVISIONED. After {rarps} RARP(s) (mode={args.rarp_mode}) the VM MAC never")
+            print(f"  became local on {dst_leaf} within {args.timeout:.0f}s. The RARP(s) hit the port before the")
+            print(f"  sub-interface/MAC-VRF were provisioned (subif up at {fmt(subif_up_t)}s) and were consumed")
+            print(f"  as the active-VLAN trigger, not forwarded. A single/burst RARP is NOT sufficient — use")
+            print(f"  sustained announcement (or continued VM traffic) spanning the provisioning window.")
+        elif mobility_t is None:
+            print(f"  TARGET UP BUT MOVE DID NOT PROPAGATE within {args.timeout:.0f}s. VM MAC is local on")
+            print(f"  {dst_leaf} at t0+{mac_local_t:.2f}s, but {src_leaf} still claims it local (aging, not")
+            print(f"  yet expired), so peers via {src_leaf} keep black-holing. The moved VM must keep sourcing")
+            print(f"  traffic to win EVPN mobility — if it goes quiet, {src_leaf}'s stale local entry wins and")
+            print(f"  the target yields to remote. Ensure sustained announcement is running (--rarp-mode")
+            print(f"  sustained, the default) and raise --timeout; a real VM keeps sending and converges in")
+            print(f"  a few seconds. (Also verify route-targets match across leaves — auto RT = local-ASN:EVI")
+            print(f"  differs per leaf under an eBGP overlay; the handler pins it. --flush-source-leaf forces")
+            print(f"  it but is NOT realistic — an ESXi trunk stays up when one VM leaves.)")
+        else:
+            print(f"  CONVERGED. Target learnt the VM at t0+{mac_local_t:.2f}s and the source leaf released it")
+            print(f"  (EVPN mobility) at t0+{mobility_t:.2f}s.")
+            if rarps_before_up:
+                print(f"  Note: {rarps_before_up} of {rarps} RARPs were emitted before the sub-interface existed")
+                print(f"  (up at t0+{fmt(subif_up_t)}s) and were dropped — a real single-shot vMotion RARP would")
+                print(f"  have been lost; sustained announcement is what carried the trigger here.")
+        print("=" * 74)
+
+        if args.json_report:
+            with open(args.json_report, "w") as f:
+                json.dump({
+                    "vlan": vlan, "vm_mac": mac, "vm_ip": ip,
+                    "src": args.src, "src_leaf": src_leaf, "src_port": src_port,
+                    "dst": args.dst, "dst_leaf": dst_leaf, "dst_port": dst_port,
+                    "rarp_mode": args.rarp_mode, "rarps_total": rarps,
+                    "rarps_before_subif_up": rarps_before_up,
+                    "subif_up_s": subif_up_t, "mac_local_s": mac_local_t,
+                    "mobility_s": mobility_t, "flush_source_leaf": args.flush_source_leaf,
+                    "no_nudge": args.no_nudge,
+                    "src_mac_after": src_after, "peer": args.peer,
+                    "peer_outage_ms": outage_ms, "peer_recovery_ms": recovery_ms,
+                }, f, indent=2)
+            print(f"Wrote {args.json_report}")
+
+    finally:
+        if not args.keep:
+            for _c in created_clients:
+                delete_subif(_c, parent, vlan)   # idempotent — ignores "does not exist"
+            print("Cleaned up VM/peer sub-interfaces (leaf dynamic config self-clears "
+                  "via retention timer).")
 
 
 def peer_id_to_mac(peer_id, vlan):

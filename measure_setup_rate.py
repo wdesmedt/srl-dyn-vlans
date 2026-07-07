@@ -8,10 +8,13 @@ measures the *switch's* provisioning rate directly: it triggers active-VLAN dete
 on a leaf port, then reads each sub-interface's `last-change` timestamp via gNMI and
 computes when each subinterface came up relative to the trigger.
 
-Because SR Linux containers share the host clock, the leaf's `last-change` (UTC) is
-directly comparable to the host trigger time. No client ARP / dataplane is involved,
-so the result reflects pure switch-side provisioning, independent of client/host
-resource limits.
+The leaf's `last-change` is on the leaf clock while the trigger time is on the host clock,
+so any host<->leaf clock offset would bias every result. The tool measures that offset per
+leaf at startup (NTP-style, from the gNMI response timestamp straddled by host time — see
+clock_offset) and corrects the device timestamps into the host clock frame. On clab (leaves
+share the host kernel clock) the offset is ~0; on real hardware it removes NTP skew. Disable
+with --no-clock-sync. No client ARP / dataplane is involved, so the result reflects pure
+switch-side provisioning, independent of client/host resource limits.
 
 Why the subinterface `last-change` also stands in for the MAC-VRF and VXLAN interface:
 the event handler (dyn_subif_custom.py / dynamic-subinterfaces.py) emits the per-VLAN
@@ -35,8 +38,12 @@ the local subif-up time). This only converges with matched route-targets across 
 overlay (the rt-asn fix in dyn_subif_custom.py). dst-FDB appearance is host-poll observed,
 so its resolution is bounded by --poll.
 
-Requirements: gnmic on the host; the leaf reachable on gNMI (default clab
-admin/NokiaSrl1!, port 57400, skip-verify).
+Requirements: `gnmic`, `ssh` and `sshpass` on the host; each leaf reachable on gNMI
+(port 57400, skip-verify) and SSH (port 22) with admin/NokiaSrl1! (overridable via
+--user/--password or env SRL_USER/SRL_PASSWORD). Node names are resolved to a management
+address via env SRL_ADDR_<node>, an SRL_INVENTORY file, or the name itself (see srl_node.py)
+— the tool talks to the leaves over gNMI+SSH, not docker. (The trigger clients are still
+driven with `docker exec`; only the SR Linux node access was moved off docker.)
 
 Trigger: the tool CREATES the client sub-interfaces for the range (bringing up a tagged
 sub-interface is itself the active-VLAN trigger on SR Linux), so the client only needs
@@ -82,36 +89,50 @@ Examples:
       --mh-client mh-client1 --vlans 1000-1049
 """
 import argparse, json, os, subprocess, sys, time
+import srl_node   # SSH (sr_cli) + gNMI (gnmic) transport to SR Linux nodes (no docker)
 
 def sh(cmd, timeout=60):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return r.returncode, r.stdout, r.stderr
 
-def docker_mgmt_ip(node):
-    """Return the management IP of a container by name, via docker inspect.
-    Picks the first non-empty address across the container's networks."""
-    code, out, _ = sh(["docker", "inspect", "-f",
-                       "{{range .NetworkSettings.Networks}}{{.IPAddress}}\n{{end}}", node])
-    if code != 0:
-        return None
-    for line in out.splitlines():
-        ip = line.strip()
-        if ip:
-            return ip
-    return None
+def node_addr(node):
+    """Management host/IP for a node name (env SRL_ADDR_<node> / inventory / the name)."""
+    return srl_node.node_addr(node)
 
 def gnmic_get(mgmt, user, pw, paths, timeout=60):
-    cmd = ["gnmic", "-a", f"{mgmt}:57400", "-u", user, "-p", pw, "--skip-verify",
-           "-e", "json_ietf", "get", "--type", "state"]
-    for p in paths:
-        cmd += ["--path", p]
-    code, out, err = sh(cmd, timeout=timeout)
-    if code != 0:
-        return None
-    try:
-        return json.loads(out)
-    except Exception:
-        return None
+    """gNMI GET against a node's management address (mgmt = host/IP), via gnmic."""
+    return srl_node.gnmi_get(None, paths, user=user, pw=pw, host=mgmt, timeout=timeout)
+
+def _resp_ts_ns(data):
+    """Node-side collection timestamp (ns since epoch) from a gnmic get response."""
+    if data:
+        for src in data:
+            ts = src.get("timestamp")
+            if isinstance(ts, (int, float)):
+                return int(ts)
+    return None
+
+def clock_offset(mgmt, user, pw, samples=5):
+    """Estimate a leaf's clock offset from the host: leaf_clock = host_clock + offset.
+
+    The setup-rate result compares the leaf's device `last-change` (leaf clock) to the host
+    trigger time, so any host<->leaf clock skew biases every number. This measures the skew
+    NTP-style: each sample straddles a gNMI GET with host time (t0, t1) and reads the node's
+    collection timestamp from the response, so offset = node_ts - (t0+t1)/2 and the RTT
+    (t1-t0) bounds its uncertainty. Keeps the lowest-RTT sample. Returns (offset_s, rtt_s)
+    or None. On the shared-clock lab this is ~0; on real hardware it removes the skew."""
+    best = None
+    for _ in range(max(1, samples)):
+        t0 = time.time()
+        data = gnmic_get(mgmt, user, pw, ["/system/information/current-datetime"])
+        t1 = time.time()
+        ts = _resp_ts_ns(data)
+        if ts is None:
+            continue
+        off, rtt = ts / 1e9 - (t0 + t1) / 2.0, t1 - t0
+        if best is None or rtt < best[1]:
+            best = (off, rtt)
+    return best
 
 def read_active_vlans(mgmt, user, pw):
     """Return {port: [vlan, ...]} for every port with detected active VLANs.
@@ -223,9 +244,12 @@ def build_trigger_script(parent, cid, vlans):
         links += [f"link add link {parent} name {vif} type vlan id {v}",
                   f"link set dev {vif} address {client_mac(cid, v)}", f"link set dev {vif} up"]
         addrs.append(f"address add 10.{v//100}.{v%100}.{cid}/24 dev {vif}")
+    # -force: don't abort the whole batch if one eth1.<vlan> already exists (e.g. a leftover
+    # from an aborted run) — skip that `link add` but still set the MAC/up/addr for every
+    # VLAN, so a single stale subif can't silently no-op the entire trigger.
     return ("cat > /tmp/_lb <<'E'\n" + "\n".join(links) + "\nE\n"
             "cat > /tmp/_ab <<'E'\n" + "\n".join(addrs) + "\nE\n"
-            "ip -batch /tmp/_lb\nip -batch /tmp/_ab\n")
+            "ip -force -batch /tmp/_lb\nip -force -batch /tmp/_ab\n")
 
 def parse_vlans(s):
     out = []
@@ -309,37 +333,27 @@ def _macvrf_delete_lines(vlan):
     return [f"delete / network-instance {name}",
             f"delete / tunnel-interface vxlan0 vxlan-interface {vlan}"]
 
-def srcli_commit(node, lines, timeout=120):
-    """Apply `set/delete` CLI lines on a leaf in one candidate commit via `sr_cli` stdin.
-    Returns (ok, output). Used for the MAC-VRF pre-warm/cleanup — sr_cli handles native YANG
-    types and one atomic commit, which is simpler and safer here than typing gNMI values."""
-    script = "\n".join(["enter candidate"] + lines + ["commit now", "quit"]) + "\n"
-    r = subprocess.run(["docker", "exec", "-i", node, "sr_cli"],
-                       input=script, text=True, capture_output=True, timeout=timeout)
-    out = (r.stdout or "") + (r.stderr or "")
-    ok = r.returncode == 0 and "Error" not in out and "failed" not in out.lower()
-    return ok, out
-
-def prewarm_macvrfs(nodes, vlans, rt_asn):
-    """Pre-provision VLAN-<id> MAC-VRFs for the range on every ES leaf. One commit per leaf."""
+def prewarm_macvrfs(nodes, vlans, rt_asn, user, pw):
+    """Pre-provision VLAN-<id> MAC-VRFs for the range on every ES leaf. One SSH `sr_cli`
+    candidate commit per leaf (sr_cli handles native YANG types + one atomic commit, which
+    is simpler and safer here than typing gNMI values)."""
     lines = []
     for v in vlans:
         lines += _macvrf_set_lines(v, rt_asn)
     results = {}
     for node in nodes:
-        ok, out = srcli_commit(node, lines)
-        results[node] = (ok, out)
+        results[node] = srl_node.commit(node, lines, user=user, pw=pw)
     return results
 
-def cleanup_macvrfs(nodes, vlans):
+def cleanup_macvrfs(nodes, vlans, user, pw):
     """Best-effort teardown of the pre-warmed MAC-VRFs on every ES leaf."""
     lines = []
     for v in vlans:
         lines += _macvrf_delete_lines(v)
     for node in nodes:
-        srcli_commit(node, lines)
+        srl_node.commit(node, lines, user=user, pw=pw)
 
-def clear_retention(node, port, vlans, timeout=120):
+def clear_retention(node, port, vlans, user, pw):
     """Force the tested VLANs out of the port's active-vlans immediately via
     `tools ... clear-retention-timer`. Without this a just-tested VLAN lingers in
     active-vlans for the whole retention-timer; once its pre-warmed MAC-VRF is then
@@ -349,15 +363,16 @@ def clear_retention(node, port, vlans, timeout=120):
     handler removes the subif while the MAC-VRF still exists) before teardown."""
     cmds = [f"tools interface {port} dynamic-subinterfaces clear-retention-timer "
             f"active-vlan-id {v}" for v in vlans]
-    subprocess.run(["docker", "exec", "-i", node, "sr_cli"],
-                   input="\n".join(cmds) + "\n", text=True, capture_output=True,
-                   timeout=timeout)
+    srl_node.sr_cli(node, cmds, user=user, pw=pw)
 
 def main():
     ap = argparse.ArgumentParser(description="Measure switch-side dynamic subinterface setup rate.")
-    ap.add_argument("--node", required=True, help="Leaf container name (docker)")
+    ap.add_argument("--node", required=True,
+                    help="Leaf node name, resolved to a management address for gNMI+SSH "
+                         "(SRL_ADDR_<node> / SRL_INVENTORY / the name itself; or --leaf-mgmt)")
     ap.add_argument("--leaf-mgmt", default=None,
-                    help="Leaf gNMI mgmt IP (default: derived from --node via docker inspect)")
+                    help="Leaf management host/IP for gNMI+SSH (default: --node resolved via "
+                         "SRL_ADDR_<node> / SRL_INVENTORY, else the node name itself)")
     ap.add_argument("--port", default="ethernet-1/1",
                     help="Trigger port for the single-interface case (default ethernet-1/1)")
     ap.add_argument("--client", default=None,
@@ -427,6 +442,14 @@ def main():
                          "VLANs to already be active; not recommended)")
     ap.add_argument("--user", default="admin")
     ap.add_argument("--password", default="NokiaSrl1!")
+    ap.add_argument("--no-clock-sync", action="store_true",
+                    help="Do not measure/correct the host<->leaf clock offset (setup times "
+                         "compare the leaf's device last-change to the host trigger time; on "
+                         "real hardware an unsynced clock skews every result — leave this ON "
+                         "unless host and leaves already share a clock, e.g. the clab lab)")
+    ap.add_argument("--clock-samples", type=int, default=5,
+                    help="Samples per leaf when measuring the clock offset (default 5; the "
+                         "lowest-RTT one is kept)")
     ap.add_argument("--poll", type=float, default=0.5, help="gNMI poll interval (s)")
     ap.add_argument("--max-wait", type=float, default=120.0, help="Hard cap: give up after this many s")
     ap.add_argument("--settle", type=float, default=10.0,
@@ -442,13 +465,13 @@ def main():
               f"range? A 'low-high' range must be ascending (e.g. 2699-3200, not 3200-2699).",
               file=sys.stderr)
         sys.exit(1)
-    mgmt = args.leaf_mgmt or docker_mgmt_ip(args.node)
+    mgmt = args.leaf_mgmt or node_addr(args.node)
     if not mgmt:
-        print(f"ERROR: could not determine gNMI mgmt IP for node '{args.node}' via "
-              f"docker inspect; pass --leaf-mgmt explicitly.", file=sys.stderr)
+        print(f"ERROR: could not resolve a management address for node '{args.node}'; "
+              f"set SRL_ADDR_{args.node} or pass --leaf-mgmt explicitly.", file=sys.stderr)
         sys.exit(1)
     if not args.leaf_mgmt:
-        print(f"Derived gNMI mgmt IP {mgmt} for {args.node}.")
+        print(f"Using management address {mgmt} for {args.node}.")
     user, pw = args.user, args.password
 
     # Resolve trigger sources and the leaf ports to measure. Three modes:
@@ -485,10 +508,10 @@ def main():
                   else (derive_cid(args.mh_client) or 1) + 20)
         triggers = [{"client": args.mh_client, "parent": args.mh_parent, "cid": mh_cid}]
         for n in mh_nodes:
-            m = mgmt if n == args.node else docker_mgmt_ip(n)
+            m = mgmt if n == args.node else node_addr(n)
             if not m:
-                print(f"ERROR: could not determine gNMI mgmt IP for MH node '{n}' via "
-                      f"docker inspect.", file=sys.stderr)
+                print(f"ERROR: could not resolve a management address for MH node '{n}' "
+                      f"(set SRL_ADDR_{n}).", file=sys.stderr)
                 sys.exit(1)
             measured.append({"node": n, "mgmt": m, "port": args.mh_port, "cid": mh_cid,
                              "client": args.mh_client, "label": f"{n}/{args.mh_port}"})
@@ -541,7 +564,7 @@ def main():
         if not args.dst_client:
             print("ERROR: --dst-client is required with --dst-node.", file=sys.stderr)
             sys.exit(1)
-        dst_mgmt = args.dst_mgmt or docker_mgmt_ip(args.dst_node)
+        dst_mgmt = args.dst_mgmt or node_addr(args.dst_node)
         if not dst_mgmt:
             print(f"ERROR: could not determine gNMI mgmt IP for dst node "
                   f"'{args.dst_node}'; pass --dst-mgmt explicitly.", file=sys.stderr)
@@ -614,6 +637,28 @@ def main():
     print(f"Range {vlans[0]}-{vlans[-1]} is cold on {port_desc} "
           f"({N} VLANs x {len(measured)} measured port(s)).")
 
+    # 1b'. Clock sync: setup times compare each leaf's device `last-change` (leaf clock) to
+    #      the host trigger time, so a host<->leaf clock offset biases every result. Measure
+    #      it per measured leaf and correct the device timestamps into the host clock frame
+    #      (offsets[node]). In the shared-clock lab this is ~0; on real hardware it removes
+    #      NTP skew. Only measured leaves contribute last-change, so only they need it.
+    offsets = {}   # node -> seconds to SUBTRACT from that leaf's device timestamps
+    if not args.no_clock_sync:
+        for node, m in check_nodes:
+            if node in offsets or node not in {md["node"] for md in measured}:
+                continue
+            r = clock_offset(m, user, pw, args.clock_samples)
+            if r is None:
+                print(f"WARNING: could not measure clock offset for {node}; assuming "
+                      f"host==leaf clock (setup times skew if they differ).", file=sys.stderr)
+                offsets[node] = 0.0
+            else:
+                off, rtt = r
+                offsets[node] = off
+                flag = "   <-- large offset; check NTP on host/leaf" if abs(off) > 1.0 else ""
+                print(f"Clock offset {node:<8}: {off:+.3f}s  (rtt {rtt*1000:.0f}ms, "
+                      f"applied to last-change){flag}")
+
     # 1c. MH pre-warm: the multi-homing handler only binds subifs into an EXISTING VLAN-<id>
     #     MAC-VRF, so create those on every ES leaf first (identical to what the single-homed
     #     handler would build; RT target:<rt-asn>:<evi>). Without this the ES-partner leaf
@@ -621,7 +666,7 @@ def main():
     if mh:
         print(f"Pre-warming {N} MAC-VRF(s) VLAN-{vlans[0]}..{vlans[-1]} (rt-asn {args.rt_asn}) "
               f"on {', '.join(mh_nodes)} ...")
-        for node, (ok, out) in prewarm_macvrfs(mh_nodes, vlans, args.rt_asn).items():
+        for node, (ok, out) in prewarm_macvrfs(mh_nodes, vlans, args.rt_asn, user, pw).items():
             if not ok:
                 print(f"ERROR: MAC-VRF pre-warm commit failed on {node}:\n"
                       f"{out.strip()[:800]}", file=sys.stderr)
@@ -728,11 +773,11 @@ def main():
     # while a VLAN is still active would poison the handler's atomic batch on the next run.
     if mh:
         for md in measured:
-            clear_retention(md["node"], md["port"], vlans)
+            clear_retention(md["node"], md["port"], vlans, user, pw)
         if not args.keep_macvrfs:
             time.sleep(2)  # let the handler drain the just-cleared VLANs before we drop the NIs
             print(f"Cleaning up pre-warmed MAC-VRFs on {', '.join(mh_nodes)} ...")
-            cleanup_macvrfs(mh_nodes, vlans)
+            cleanup_macvrfs(mh_nodes, vlans, user, pw)
 
     def pctl(xs, p):
         xs = sorted(xs); k = (len(xs)-1)*p/100.0; lo = int(k); hi = min(lo+1, len(xs)-1)
@@ -745,7 +790,10 @@ def main():
     all_ts = []
     for md in measured:
         st = final_st[md["label"]]
-        s = [(v, st[v]["ts"] - trigger_t) for v in vlans if st.get(v, {}).get("ts")]
+        # Convert each leaf's device last-change into the host clock frame (subtract the
+        # measured host<->leaf offset) before differencing against the host trigger time.
+        off = offsets.get(md["node"], 0.0)
+        s = [(v, st[v]["ts"] - off - trigger_t) for v in vlans if st.get(v, {}).get("ts")]
         s.sort(key=lambda x: x[1])
         up_v = set(v for v, _ in s)
         per_port.append({"port": md["port"], "node": md["node"], "label": md["label"],
@@ -758,6 +806,15 @@ def main():
     n_up = len(all_ts)
     if n_up == 0:
         print("No subinterfaces came up; nothing to measure.", file=sys.stderr)
+        if mh:
+            # Most common cause: --mh-port points at a LAG *member* instead of the ES
+            # interface. On a LACP-LAG segment the active-vlans and dynamic subifs live on
+            # the lag (e.g. lag11), not ethernet-1/X — check where the ES is bound.
+            print(f"Hint (MH): confirm --mh-port ({args.mh_port}) is the interface the "
+                  f"Ethernet Segment is bound to and where active-vlans appears — on a LACP "
+                  f"LAG that is the lag (e.g. lag11), not a member port. Check with: "
+                  f"info from state interface {args.mh_port} dynamic-subinterfaces active-vlans",
+                  file=sys.stderr)
         sys.exit(1)
     all_ts.sort()
     first, last = all_ts[0], all_ts[-1]
@@ -841,7 +898,7 @@ def main():
         report = {"node": args.node, "mode": "mh" if mh else ("multi" if multi else "single"),
                   "num_vlans": N, "num_ports": len(measured), "subifs_requested": target,
                   "n_up": n_up, "not_provisioned": total_missing, "stalled": stalled,
-                  "first_s": first, "last_s": last,
+                  "clock_offsets_s": offsets, "first_s": first, "last_s": last,
                   "ramp_rate": ramp_rate, "overall_rate": overall_rate,
                   "interfaces": [
                       {"node": p["node"], "port": p["port"], "label": p["label"],
